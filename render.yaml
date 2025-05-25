@@ -77,19 +77,23 @@ services:
         value: "false" # Set to "true" if you want to use OpenAI and have the key
     autoDeploy: yes
 
+# ... (previous parts of render.yaml are the same) ...
+
   - name: executor-day
     type: worker
     env: docker
     region: frankfurt
     plan: standard
     dockerfilePath: ./executors/Dockerfile # Shared Dockerfile for executors
-    startCommand: "python -u alpaca_day.py" # Overrides CMD in Dockerfile
+    # startCommand: "python -u alpaca_day.py" # REMOVE THIS LINE
     envVars:
       - fromGroup: common-db-config
       - fromGroup: alpaca-api-keys
       - fromGroup: other-api-keys # For FINNHUB_API_KEY
       - key: ROLE
-        value: "daytrade" # As per your docker-compose.yml
+        value: "daytrade"
+      - key: EXECUTOR_SCRIPT # Add this
+        value: "alpaca_day.py"
     autoDeploy: yes
 
   - name: executor-swing
@@ -98,13 +102,15 @@ services:
     region: frankfurt
     plan: standard
     dockerfilePath: ./executors/Dockerfile # Shared Dockerfile for executors
-    startCommand: "python -u alpaca_swing.py" # Overrides CMD in Dockerfile
+    # startCommand: "python -u alpaca_swing.py" # REMOVE THIS LINE
     envVars:
       - fromGroup: common-db-config
       - fromGroup: alpaca-api-keys
       - fromGroup: other-api-keys # For Telegram keys
       - key: ROLE
-        value: "swing" # As per your docker-compose.yml
+        value: "swing"
+      - key: EXECUTOR_SCRIPT # Add this
+        value: "alpaca_swing.py"
     autoDeploy: yes
 
   - name: executor-options
@@ -113,11 +119,13 @@ services:
     region: frankfurt
     plan: standard
     dockerfilePath: ./executors/Dockerfile # Shared Dockerfile for executors
-    startCommand: "python -u alpaca_options.py" # Overrides CMD in Dockerfile
+    # startCommand: "python -u alpaca_options.py" # REMOVE THIS LINE
     envVars:
       - fromGroup: common-db-config
       - fromGroup: alpaca-api-keys
       - fromGroup: other-api-keys # For Telegram keys
       - key: ROLE
-        value: "options" # As per your docker-compose.yml
+        value: "options"
+      - key: EXECUTOR_SCRIPT # Add this
+        value: "alpaca_options.py"
     autoDeploy: yes

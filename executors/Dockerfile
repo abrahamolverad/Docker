@@ -1,17 +1,23 @@
-# ---- base image -----------------------------------------------------------
-    FROM python:3.11-slim
+# executors/Dockerfile
+FROM python:3.11-slim # Or your preferred Python version
 
-    # ---- copy code ------------------------------------------------------------
-    WORKDIR /app
-    COPY . /app
-    
-    # ---- install Python deps --------------------------------------------------
-    RUN pip install --no-cache-dir -r requirements.txt
-    
-    # ---- generate the fresh S&P-500 list --------------------------------------
-    RUN python generate_sp500_list.py   # creates /app/sp500_symbols.txt
-    
-    # ---- runtime settings -----------------------------------------------------
-    ENV PYTHONUNBUFFERED=1
-    CMD ["python", "alpaca_base.py"]     # or the specific executor script
-    
+WORKDIR /app
+
+# Copy requirements first to leverage Docker cache
+COPY ./executors/requirements.txt requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy all files from the executors directory into the image's /app directory
+# This will include your .py scripts and the new entrypoint.sh
+COPY ./executors/ /app/
+
+# Make the entrypoint script executable
+RUN chmod +x /app/entrypoint.sh
+
+# Set the entrypoint
+ENTRYPOINT ["/app/entrypoint.sh"]
+
+# You don't need a CMD here if the entrypoint handles the logic or
+# if EXECUTOR_SCRIPT will always be provided.
+# If you wanted a default script if EXECUTOR_SCRIPT wasn't set,
+# your entrypoint.sh would need to handle that logic.
