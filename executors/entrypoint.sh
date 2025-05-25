@@ -1,9 +1,8 @@
 ﻿#!/bin/sh
-# entrypoint.sh - Executes the Python script specified by EXECUTOR_SCRIPT
-
+# Ensuring LF line endings with this new comment
 # Exit immediately if a command exits with a non-zero status.
 set -e
-
+# ... rest of your script
 if [ -z "" ]; then
   echo "Error: EXECUTOR_SCRIPT environment variable is not set."
   exit 1
