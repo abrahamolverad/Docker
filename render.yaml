@@ -40,20 +40,18 @@ envVarGroups:
 services:
   - name: webapi # Your FastAPI backend
     type: web
-    env: docker # Specifies that Render should build from a Dockerfile
-    repo: https://github.com/abrahamolverad/Docker-2ffa73d8060aa54be0519a0e9aaf48cda81b6641.git # Optional: Explicitly specify repo if needed, usually inferred
-    region: frankfurt # Or your preferred region, e.g., ohio, oregon, singapore
-    plan: standard # Or your preferred plan (free plan has limitations)
+    env: docker
+    # repo: line removed - Render will use the repo connected at the Blueprint level
+    region: frankfurt
+    plan: standard
     dockerfilePath: ./web_api/Dockerfile
-    # The CMD in your web_api/Dockerfile should be: CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
-    # Render automatically detects the port from the Dockerfile's EXPOSE or the running process.
     healthCheckPath: /health # From your web_api/app.py
     envVars:
       - fromGroup: common-db-config
-    autoDeploy: yes # Optional: set to 'no' for manual deploys
+    autoDeploy: yes
 
   - name: scanners # Your scanners service
-    type: worker # Background worker, not publicly accessible via HTTP
+    type: worker
     env: docker
     region: frankfurt
     plan: standard
@@ -77,22 +75,19 @@ services:
         value: "false" # Set to "true" if you want to use OpenAI and have the key
     autoDeploy: yes
 
-# ... (previous parts of render.yaml are the same) ...
-
   - name: executor-day
     type: worker
     env: docker
     region: frankfurt
     plan: standard
     dockerfilePath: ./executors/Dockerfile # Shared Dockerfile for executors
-    # startCommand: "python -u alpaca_day.py" # REMOVE THIS LINE
     envVars:
       - fromGroup: common-db-config
       - fromGroup: alpaca-api-keys
       - fromGroup: other-api-keys # For FINNHUB_API_KEY
       - key: ROLE
-        value: "daytrade"
-      - key: EXECUTOR_SCRIPT # Add this
+        value: "daytrade" # As per your docker-compose.yml
+      - key: EXECUTOR_SCRIPT
         value: "alpaca_day.py"
     autoDeploy: yes
 
@@ -102,14 +97,13 @@ services:
     region: frankfurt
     plan: standard
     dockerfilePath: ./executors/Dockerfile # Shared Dockerfile for executors
-    # startCommand: "python -u alpaca_swing.py" # REMOVE THIS LINE
     envVars:
       - fromGroup: common-db-config
       - fromGroup: alpaca-api-keys
       - fromGroup: other-api-keys # For Telegram keys
       - key: ROLE
-        value: "swing"
-      - key: EXECUTOR_SCRIPT # Add this
+        value: "swing" # As per your docker-compose.yml
+      - key: EXECUTOR_SCRIPT
         value: "alpaca_swing.py"
     autoDeploy: yes
 
@@ -119,13 +113,12 @@ services:
     region: frankfurt
     plan: standard
     dockerfilePath: ./executors/Dockerfile # Shared Dockerfile for executors
-    # startCommand: "python -u alpaca_options.py" # REMOVE THIS LINE
     envVars:
       - fromGroup: common-db-config
       - fromGroup: alpaca-api-keys
       - fromGroup: other-api-keys # For Telegram keys
       - key: ROLE
-        value: "options"
-      - key: EXECUTOR_SCRIPT # Add this
+        value: "options" # As per your docker-compose.yml
+      - key: EXECUTOR_SCRIPT
         value: "alpaca_options.py"
     autoDeploy: yes
