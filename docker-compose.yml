@@ -1,0 +1,86 @@
+# ────────── docker-compose.yml ──────────
+services:
+
+  # 1) MongoDB (shared)
+  db:
+    image: mongo:6
+    container_name: db
+    restart: unless-stopped
+    environment:
+      # use the same URI you already defined
+      MONGO_INITDB_ROOT_USERNAME: rokai
+      MONGO_INITDB_ROOT_PASSWORD: SuperStrong123
+    volumes:
+      - dbdata:/data/db
+
+  # 2) Deterministic scanners
+  scanners:
+    build: ./scanners
+    container_name: scanners
+    depends_on: [db]
+    env_file: .env
+    restart: unless-stopped
+
+  # 3) Router (AI meta-layer)
+  router:
+  build: ./meta_ai
+  container_name: router
+  depends_on: [db, scanners]
+  env_file: .env
+  restart: unless-stopped
+  environment:
+    USE_OPENAI: "false"
+    # OPENAI_API_KEY: ${OPENAI_API_KEY}  # Comment out this line
+  command: ["python", "strategy_router.py"]
+
+  # 4) Executors – one per Alpaca paper account
+  executor_day:
+    build: ./executors
+    container_name: executor_day
+    depends_on: [db, router]
+    env_file: .env
+    restart: unless-stopped
+    environment:
+      ROLE: daytrade
+      ALPACA_KEY:    ${ALPACA_API_KEY}
+      ALPACA_SECRET: ${ALPACA_SECRET_KEY}
+    command: ["python", "-u", "alpaca_day.py"]
+
+  executor_swing:
+    build: ./executors
+    container_name: executor_swing
+    depends_on: [db, router]
+    env_file: .env
+    restart: unless-stopped
+    environment:
+      ROLE: swing
+      ALPACA_KEY:    ${ALPACA_SCALPINGSNIPER_KEY}
+      ALPACA_SECRET: ${ALPACA_SCALPINGSNIPER_SECRET_KEY}
+    command: ["python", "-u", "alpaca_swing.py"]
+
+  executor_options:
+    build: ./executors
+    container_name: executor_options
+    depends_on: [db, router]
+    env_file: .env
+    restart: unless-stopped
+    environment:
+      ROLE: options
+      ALPACA_KEY:    ${ALPACA_UNHOLY_KEY}
+      ALPACA_SECRET: ${ALPACA_UNHOLY_SECRET_KEY}
+    command: ["python", "-u", "alpaca_options.py"]
+
+  # 5) FastAPI back-end (dashboard API)
+  webapi:
+    build: ./web_api
+    container_name: webapi
+    depends_on: [db]
+    env_file: .env
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+
+volumes:
+  dbdata:
+# ────────── end docker-compose.yml ──────────

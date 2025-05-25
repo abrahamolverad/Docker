@@ -1,0 +1,15 @@
+alpaca-py
+pymongo
+python-dotenv
+schedule
+scipy
+python-telegram-bot==20.7
+pandas_ta
+vaderSentiment
+finnhub-python
+yfinance
+yahoo_fin
+ta
+pytz
+schedule
+numpy==1.26.4  

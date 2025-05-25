@@ -1,0 +1,15 @@
+<DATE>{date}</DATE>
+<REGIME>{regime}</REGIME>
+<DAYTRADE_STATS>{daytrade_stats}</DAYTRADE_STATS>
+
+Return valid JSON that looks exactly like:
+
+
+{{
+  "playbooks": {{
+    "daytrade": {{ "enabled": true,  "max_positions": 3 }},
+    "swing":    {{ "enabled": false }},
+    "options":  {{ "enabled": true,  "max_positions": 2 }}
+  }},
+  "explanation": "short reason here"
+}}

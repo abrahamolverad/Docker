@@ -1,0 +1,12 @@
+alpaca-py
+pandas
+numpy
+scipy
+pymongo
+python-dotenv
+pytz
+ta
+requests
+schedule
+vaderSentiment
+finnhub-python      # ← NEW
