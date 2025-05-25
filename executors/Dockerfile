@@ -1,5 +1,5 @@
 # executors/Dockerfile
-FROM python:3.11-slim # Or your preferred Python version
+FROM python:3.11-slim
 
 WORKDIR /app
 
