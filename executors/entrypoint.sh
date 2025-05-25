@@ -1,22 +1,21 @@
-﻿#!/bin/sh
-# Ensuring LF line endings with this new comment
-# Exit immediately if a command exits with a non-zero status.
+#!/bin/sh
+# Entrypoint for executor services
+
 set -e
-# ... rest of your script
-if [ -z "" ]; then
-  echo "Error: EXECUTOR_SCRIPT environment variable is not set."
+
+if [ -z "$EXECUTOR_SCRIPT" ]; then
+  echo "Error: EXECUTOR_SCRIPT environment variable is not set. This script requires it."
   exit 1
 fi
 
-echo "Attempting to run Python script: "
+echo "Attempting to run Python script specified by EXECUTOR_SCRIPT: [$EXECUTOR_SCRIPT]"
 
-# Check if the script exists and is readable
-if [ ! -f "" ]; then
-    echo "Error: Script  not found in /app/ directory."
-    ls -la /app/ # List directory contents for debugging
+# Check if the target Python script exists in /app/
+if [ ! -f "/app/$EXECUTOR_SCRIPT" ]; then
+    echo "Error: Target Python script /app/$EXECUTOR_SCRIPT not found."
+    echo "Contents of /app/ directory:"
+    ls -la /app/
     exit 1
 fi
 
-# Execute the specified Python script
-# The "-u" flag ensures that Python output is unbuffered, which is good for logging.
-exec python -u ""
+exec python -u "$EXECUTOR_SCRIPT"
