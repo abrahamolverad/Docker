@@ -151,17 +151,17 @@ services:
     envVars:
       - fromGroup: common-db-config # If your crypto script uses MongoDB
       - fromGroup: binance-api-keys # Use the new group for Binance keys
-      # The script will pick up BINANCE_API_KEY and BINANCE_SECRET_KEY from the group.
-      # If you've also set BINANCE_FUTURES_API_KEY / BINANCE_FUTURES_SECRET_KEY in the group,
-      # the script's logic os.getenv("BINANCE_FUTURES_API_KEY", os.getenv("BINANCE_API_KEY")) will prioritize those.
+      - fromGroup: other-api-keys   # This makes Crypto_TELEGRAM_BOT_TOKEN, CRYPTO_TELEGRAM_USER_ID, etc. available
 
-      # Environment variables for Crypto_Genie_V6.3 script's os.getenv calls:
-      - key: Crypto_TELEGRAM_BOT_TOKEN # Script uses os.getenv("Crypto_TELEGRAM_BOT_TOKEN")
-        fromGroup: other-api-keys # Assuming added to this group
-      - key: TELEGRAM_USER_ID # Script uses os.getenv("TELEGRAM_USER_ID")
-        valueFrom: CRYPTO_TELEGRAM_USER_ID # Pulls specific value from other-api-keys
-      - key: AUTHORIZED_TELEGRAM_USER_IDS # Script uses os.getenv("AUTHORIZED_TELEGRAM_USER_IDS")
-        valueFrom: CRYPTO_AUTHORIZED_TELEGRAM_USER_IDS # Pulls specific value from other-api-keys
+      # The script crypto_genie.py expects TELEGRAM_USER_ID and AUTHORIZED_TELEGRAM_USER_IDS.
+      # Their values come from CRYPTO_TELEGRAM_USER_ID and CRYPTO_AUTHORIZED_TELEGRAM_USER_IDS in the 'other-api-keys' group.
+      - key: TELEGRAM_USER_ID
+        valueFrom: CRYPTO_TELEGRAM_USER_ID
+      - key: AUTHORIZED_TELEGRAM_USER_IDS
+        valueFrom: CRYPTO_AUTHORIZED_TELEGRAM_USER_IDS
+      
+      # Crypto_TELEGRAM_BOT_TOKEN is used by the script with that exact name, 
+      # and it's available from the 'other-api-keys' group due to the general fromGroup import above.
 
       - key: ROLE # For consistency or if your entrypoint/logging uses it
         value: "crypto"
