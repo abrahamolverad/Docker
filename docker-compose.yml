@@ -70,6 +70,23 @@ services:
       ALPACA_SECRET: ${ALPACA_UNHOLY_SECRET_KEY}
     command: ["python", "-u", "alpaca_options.py"]
 
+  # NEW: Crypto Executor
+  executor_crypto:
+    build: ./executors
+    container_name: executor_crypto
+    depends_on: [db]  # Assuming it might need DB; adjust if not
+    env_file: .env
+    restart: unless-stopped
+    environment:
+      ROLE: crypto
+      # Environment variables for Crypto_Genie_V6.3
+      BINANCE_API_KEY: ${BINANCE_FUTURES_API_KEY} # Or BINANCE_API_KEY as per script logic
+      BINANCE_SECRET_KEY: ${BINANCE_FUTURES_SECRET_KEY} # Or BINANCE_SECRET_KEY
+      Crypto_TELEGRAM_BOT_TOKEN: ${Crypto_TELEGRAM_BOT_TOKEN}
+      TELEGRAM_USER_ID: ${CRYPTO_TELEGRAM_USER_ID} # Using a distinct name for clarity
+      AUTHORIZED_TELEGRAM_USER_IDS: ${CRYPTO_AUTHORIZED_TELEGRAM_USER_IDS} # Using a distinct name
+    command: ["python", "-u", "crypto_genie.py"] # Your new crypto script filename
+
   # 5) FastAPI back-end (dashboard API)
   webapi:
     build: ./web_api

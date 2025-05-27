@@ -13,3 +13,5 @@ ta
 pytz
 schedule
 numpy==1.26.4  
+python-binance
+requests

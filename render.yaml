@@ -8,7 +8,7 @@ envVarGroups:
     envVars:
       - key: MONGODB_URI
         value: "YOUR_MONGODB_ATLAS_CONNECTION_STRING_HERE" # IMPORTANT: Replace with your actual MongoDB Atlas URI
-  - name: alpaca-api-keys
+  - name: alpaca-api-keys # For existing Alpaca-based stock bots
     envVars:
       - key: ALPACA_API_KEY # Used by executor-day (and daytrade_genie.py)
         value: "YOUR_ALPACA_API_KEY_FOR_DAYTRADE_HERE"
@@ -22,6 +22,18 @@ envVarGroups:
         value: "YOUR_ALPACA_UNHOLY_KEY_HERE"
       - key: ALPACA_UNHOLY_SECRET_KEY # Used by executor-options
         value: "YOUR_ALPACA_UNHOLY_SECRET_KEY_HERE"
+  - name: binance-api-keys # NEW: For Binance keys for the crypto script
+    envVars:
+      # The script uses os.getenv("BINANCE_FUTURES_API_KEY", os.getenv("BINANCE_API_KEY"))
+      # Prioritize FUTURES keys if you use them, otherwise provide SPOT keys via BINANCE_API_KEY.
+      - key: BINANCE_API_KEY # General Binance API Key (Spot or if Futures key not set)
+        value: "YOUR_BINANCE_SPOT_OR_GENERAL_API_KEY"
+      - key: BINANCE_SECRET_KEY # General Binance Secret Key
+        value: "YOUR_BINANCE_SPOT_OR_GENERAL_SECRET_KEY"
+      - key: BINANCE_FUTURES_API_KEY # Optional: If you want to use specific Futures keys
+        value: "YOUR_BINANCE_FUTURES_API_KEY_HERE_IF_DIFFERENT"
+      - key: BINANCE_FUTURES_SECRET_KEY # Optional
+        value: "YOUR_BINANCE_FUTURES_SECRET_KEY_HERE_IF_DIFFERENT"
   - name: other-api-keys
     envVars:
       - key: OPENAI_API_KEY # Used by router
@@ -31,21 +43,28 @@ envVarGroups:
       - key: Slcaper_Stock_TELEGRAM_BOT_TOKEN # Typo from alpaca_swing.py, should be Scalper_Stock_...
         value: "YOUR_SCALPER_TELEGRAM_BOT_TOKEN_HERE" # Check original file for correct name
       - key: TELEGRAM_CHAT_ID # Used by alpaca_swing.py
-        value: "YOUR_TELEGRAM_CHAT_ID_HERE"
+        value: "YOUR_TELEGRAM_CHAT_ID_HERE" # This is the general one for alpaca_swing
       - key: Unholy_TELEGRAM_BOT_TOKEN # Used by alpaca_options.py
         value: "YOUR_UNHOLY_TELEGRAM_BOT_TOKEN_HERE"
-      - key: TELEGRAM_USER_ID # Used by alpaca_options.py
+      - key: TELEGRAM_USER_ID # Used by alpaca_options.py (Unholy bot)
         value: "YOUR_UNHOLY_TELEGRAM_USER_ID_HERE"
+      # NEW Telegram ENVs for Crypto_Genie_V6.3
+      - key: Crypto_TELEGRAM_BOT_TOKEN # As used in Crypto_Genie_V6.3
+        value: "YOUR_CRYPTO_GENIE_TELEGRAM_BOT_TOKEN"
+      - key: CRYPTO_TELEGRAM_USER_ID # Specific ID for Crypto_Genie's TELEGRAM_USER_ID env
+        value: "YOUR_CRYPTO_GENIE_PRIMARY_TELEGRAM_USER_ID"
+      - key: CRYPTO_AUTHORIZED_TELEGRAM_USER_IDS # Specific authorized IDs for Crypto_Genie
+        value: "YOUR_CRYPTO_GENIE_AUTHORIZED_IDS_COMMA_SEP"
+
 
 services:
   - name: webapi # Your FastAPI backend
     type: web
     env: docker
-    # repo: line removed - Render will use the repo connected at the Blueprint level
     region: frankfurt
     plan: standard
     dockerfilePath: ./web_api/Dockerfile
-    healthCheckPath: /health # From your web_api/app.py
+    healthCheckPath: /health
     envVars:
       - fromGroup: common-db-config
     autoDeploy: yes
@@ -55,7 +74,7 @@ services:
     env: docker
     region: frankfurt
     plan: standard
-    dockerfilePath: ./scanners/Dockerfile # This Dockerfile should CMD ["python", "daytrade_genie.py"]
+    dockerfilePath: ./scanners/Dockerfile
     envVars:
       - fromGroup: common-db-config
       - fromGroup: alpaca-api-keys # Assuming daytrade_genie needs the primary Alpaca keys
@@ -67,12 +86,12 @@ services:
     env: docker
     region: frankfurt
     plan: standard
-    dockerfilePath: ./meta_ai/Dockerfile # This Dockerfile should CMD ["python", "strategy_router.py"]
+    dockerfilePath: ./meta_ai/Dockerfile
     envVars:
       - fromGroup: common-db-config
       - fromGroup: other-api-keys # For OPENAI_API_KEY
-      - key: USE_OPENAI # As per your docker-compose.yml
-        value: "false" # Set to "true" if you want to use OpenAI and have the key
+      - key: USE_OPENAI
+        value: "false"
     autoDeploy: yes
 
   - name: executor-day
@@ -80,15 +99,15 @@ services:
     env: docker
     region: frankfurt
     plan: standard
-    dockerfilePath: ./executors/Dockerfile # Shared Dockerfile for executors
+    dockerfilePath: ./executors/Dockerfile
     envVars:
       - fromGroup: common-db-config
       - fromGroup: alpaca-api-keys
       - fromGroup: other-api-keys # For FINNHUB_API_KEY
       - key: ROLE
-        value: "daytrade" # As per your docker-compose.yml
+        value: "daytrade"
       - key: EXECUTOR_SCRIPT
-        value: "alpaca_day.py"
+        value: "alpaca_day.py" # Corresponds to daytrade_genie.py in uploaded files
     autoDeploy: yes
 
   - name: executor-swing
@@ -96,13 +115,13 @@ services:
     env: docker
     region: frankfurt
     plan: standard
-    dockerfilePath: ./executors/Dockerfile # Shared Dockerfile for executors
+    dockerfilePath: ./executors/Dockerfile
     envVars:
       - fromGroup: common-db-config
       - fromGroup: alpaca-api-keys
       - fromGroup: other-api-keys # For Telegram keys
       - key: ROLE
-        value: "swing" # As per your docker-compose.yml
+        value: "swing"
       - key: EXECUTOR_SCRIPT
         value: "alpaca_swing.py"
     autoDeploy: yes
@@ -112,13 +131,40 @@ services:
     env: docker
     region: frankfurt
     plan: standard
-    dockerfilePath: ./executors/Dockerfile # Shared Dockerfile for executors
+    dockerfilePath: ./executors/Dockerfile
     envVars:
       - fromGroup: common-db-config
       - fromGroup: alpaca-api-keys
       - fromGroup: other-api-keys # For Telegram keys
       - key: ROLE
-        value: "options" # As per your docker-compose.yml
+        value: "options"
       - key: EXECUTOR_SCRIPT
         value: "alpaca_options.py"
+    autoDeploy: yes
+
+  - name: executor-crypto # NEW CRYPTO SERVICE
+    type: worker
+    env: docker
+    region: frankfurt
+    plan: standard
+    dockerfilePath: ./executors/Dockerfile # Uses the same executor Dockerfile
+    envVars:
+      - fromGroup: common-db-config # If your crypto script uses MongoDB
+      - fromGroup: binance-api-keys # Use the new group for Binance keys
+      # The script will pick up BINANCE_API_KEY and BINANCE_SECRET_KEY from the group.
+      # If you've also set BINANCE_FUTURES_API_KEY / BINANCE_FUTURES_SECRET_KEY in the group,
+      # the script's logic os.getenv("BINANCE_FUTURES_API_KEY", os.getenv("BINANCE_API_KEY")) will prioritize those.
+
+      # Environment variables for Crypto_Genie_V6.3 script's os.getenv calls:
+      - key: Crypto_TELEGRAM_BOT_TOKEN # Script uses os.getenv("Crypto_TELEGRAM_BOT_TOKEN")
+        fromGroup: other-api-keys # Assuming added to this group
+      - key: TELEGRAM_USER_ID # Script uses os.getenv("TELEGRAM_USER_ID")
+        valueFrom: CRYPTO_TELEGRAM_USER_ID # Pulls specific value from other-api-keys
+      - key: AUTHORIZED_TELEGRAM_USER_IDS # Script uses os.getenv("AUTHORIZED_TELEGRAM_USER_IDS")
+        valueFrom: CRYPTO_AUTHORIZED_TELEGRAM_USER_IDS # Pulls specific value from other-api-keys
+
+      - key: ROLE # For consistency or if your entrypoint/logging uses it
+        value: "crypto"
+      - key: EXECUTOR_SCRIPT # Tells entrypoint.sh which Python script to run
+        value: "crypto_genie.py" # Assumed filename for Crypto_Genie_V6.3
     autoDeploy: yes
