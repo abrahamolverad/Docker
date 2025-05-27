@@ -56,7 +56,6 @@ envVarGroups:
       - key: CRYPTO_AUTHORIZED_TELEGRAM_USER_IDS # Specific authorized IDs for Crypto_Genie
         value: "YOUR_CRYPTO_GENIE_AUTHORIZED_IDS_COMMA_SEP"
 
-
 services:
   - name: webapi # Your FastAPI backend
     type: web
@@ -77,8 +76,8 @@ services:
     dockerfilePath: ./scanners/Dockerfile
     envVars:
       - fromGroup: common-db-config
-      - fromGroup: alpaca-api-keys # Assuming daytrade_genie needs the primary Alpaca keys
-      - fromGroup: other-api-keys # For FINNHUB_API_KEY
+      - fromGroup: alpaca-api-keys
+      - fromGroup: other-api-keys
     autoDeploy: yes
 
   - name: router # Your meta_ai service
@@ -89,7 +88,7 @@ services:
     dockerfilePath: ./meta_ai/Dockerfile
     envVars:
       - fromGroup: common-db-config
-      - fromGroup: other-api-keys # For OPENAI_API_KEY
+      - fromGroup: other-api-keys
       - key: USE_OPENAI
         value: "false"
     autoDeploy: yes
@@ -103,11 +102,11 @@ services:
     envVars:
       - fromGroup: common-db-config
       - fromGroup: alpaca-api-keys
-      - fromGroup: other-api-keys # For FINNHUB_API_KEY
+      - fromGroup: other-api-keys
       - key: ROLE
         value: "daytrade"
       - key: EXECUTOR_SCRIPT
-        value: "alpaca_day.py" # Corresponds to daytrade_genie.py in uploaded files
+        value: "alpaca_day.py"
     autoDeploy: yes
 
   - name: executor-swing
@@ -119,7 +118,7 @@ services:
     envVars:
       - fromGroup: common-db-config
       - fromGroup: alpaca-api-keys
-      - fromGroup: other-api-keys # For Telegram keys
+      - fromGroup: other-api-keys
       - key: ROLE
         value: "swing"
       - key: EXECUTOR_SCRIPT
@@ -135,7 +134,7 @@ services:
     envVars:
       - fromGroup: common-db-config
       - fromGroup: alpaca-api-keys
-      - fromGroup: other-api-keys # For Telegram keys
+      - fromGroup: other-api-keys
       - key: ROLE
         value: "options"
       - key: EXECUTOR_SCRIPT
@@ -147,24 +146,19 @@ services:
     env: docker
     region: frankfurt
     plan: standard
-    dockerfilePath: ./executors/Dockerfile # Uses the same executor Dockerfile
+    dockerfilePath: ./executors/Dockerfile
     envVars:
-      - fromGroup: common-db-config # If your crypto script uses MongoDB
-      - fromGroup: binance-api-keys # Use the new group for Binance keys
-      - fromGroup: other-api-keys   # This makes Crypto_TELEGRAM_BOT_TOKEN, CRYPTO_TELEGRAM_USER_ID, etc. available
+      - fromGroup: common-db-config
+      - fromGroup: binance-api-keys
+      - fromGroup: other-api-keys
 
-      # The script crypto_genie.py expects TELEGRAM_USER_ID and AUTHORIZED_TELEGRAM_USER_IDS.
-      # Their values come from CRYPTO_TELEGRAM_USER_ID and CRYPTO_AUTHORIZED_TELEGRAM_USER_IDS in the 'other-api-keys' group.
       - key: TELEGRAM_USER_ID
         valueFrom: CRYPTO_TELEGRAM_USER_ID
       - key: AUTHORIZED_TELEGRAM_USER_IDS
         valueFrom: CRYPTO_AUTHORIZED_TELEGRAM_USER_IDS
       
-      # Crypto_TELEGRAM_BOT_TOKEN is used by the script with that exact name, 
-      # and it's available from the 'other-api-keys' group due to the general fromGroup import above.
-
-      - key: ROLE # For consistency or if your entrypoint/logging uses it
+      - key: ROLE
         value: "crypto"
-      - key: EXECUTOR_SCRIPT # Tells entrypoint.sh which Python script to run
-        value: "crypto_genie.py" # Assumed filename for Crypto_Genie_V6.3
+      - key: EXECUTOR_SCRIPT
+        value: "crypto_genie.py"
     autoDeploy: yes
