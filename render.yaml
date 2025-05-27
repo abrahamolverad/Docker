@@ -1,8 +1,6 @@
 # render.yaml
 # Blueprint for deploying the multi-service Rok-AI application
 
-# Define Environment Groups for shared secrets and configurations
-# Replace placeholder values with your actual secrets in the Render Dashboard.
 envVarGroups:
   - name: common-db-config
     envVars:
@@ -10,54 +8,52 @@ envVarGroups:
         value: "YOUR_MONGODB_ATLAS_CONNECTION_STRING_HERE" # IMPORTANT: Replace with your actual MongoDB Atlas URI
   - name: alpaca-api-keys # For existing Alpaca-based stock bots
     envVars:
-      - key: ALPACA_API_KEY # Used by executor-day (and daytrade_genie.py)
+      - key: ALPACA_API_KEY
         value: "YOUR_ALPACA_API_KEY_FOR_DAYTRADE_HERE"
-      - key: ALPACA_SECRET_KEY # Used by executor-day (and daytrade_genie.py)
+      - key: ALPACA_SECRET_KEY
         value: "YOUR_ALPACA_SECRET_KEY_FOR_DAYTRADE_HERE"
-      - key: ALPACA_SCALPINGSNIPER_KEY # Used by executor-swing
+      - key: ALPACA_SCALPINGSNIPER_KEY
         value: "YOUR_ALPACA_SCALPINGSNIPER_KEY_HERE"
-      - key: ALPACA_SCALPINGSNIPER_SECRET_KEY # Used by executor-swing
+      - key: ALPACA_SCALPINGSNIPER_SECRET_KEY
         value: "YOUR_ALPACA_SCALPINGSNIPER_SECRET_KEY_HERE"
-      - key: ALPACA_UNHOLY_KEY # Used by executor-options
+      - key: ALPACA_UNHOLY_KEY
         value: "YOUR_ALPACA_UNHOLY_KEY_HERE"
-      - key: ALPACA_UNHOLY_SECRET_KEY # Used by executor-options
+      - key: ALPACA_UNHOLY_SECRET_KEY
         value: "YOUR_ALPACA_UNHOLY_SECRET_KEY_HERE"
   - name: binance-api-keys # NEW: For Binance keys for the crypto script
     envVars:
-      # The script uses os.getenv("BINANCE_FUTURES_API_KEY", os.getenv("BINANCE_API_KEY"))
-      # Prioritize FUTURES keys if you use them, otherwise provide SPOT keys via BINANCE_API_KEY.
-      - key: BINANCE_API_KEY # General Binance API Key (Spot or if Futures key not set)
+      - key: BINANCE_API_KEY
         value: "YOUR_BINANCE_SPOT_OR_GENERAL_API_KEY"
-      - key: BINANCE_SECRET_KEY # General Binance Secret Key
+      - key: BINANCE_SECRET_KEY
         value: "YOUR_BINANCE_SPOT_OR_GENERAL_SECRET_KEY"
-      - key: BINANCE_FUTURES_API_KEY # Optional: If you want to use specific Futures keys
+      - key: BINANCE_FUTURES_API_KEY
         value: "YOUR_BINANCE_FUTURES_API_KEY_HERE_IF_DIFFERENT"
-      - key: BINANCE_FUTURES_SECRET_KEY # Optional
+      - key: BINANCE_FUTURES_SECRET_KEY
         value: "YOUR_BINANCE_FUTURES_SECRET_KEY_HERE_IF_DIFFERENT"
   - name: other-api-keys
     envVars:
-      - key: OPENAI_API_KEY # Used by router
+      - key: OPENAI_API_KEY
         value: "YOUR_OPENAI_API_KEY_HERE"
-      - key: FINNHUB_API_KEY # Used by scanners (daytrade_genie.py) and executor-day (alpaca_day.py)
+      - key: FINNHUB_API_KEY
         value: "YOUR_FINNHUB_API_KEY_HERE"
       - key: Slcaper_Stock_TELEGRAM_BOT_TOKEN # Typo from alpaca_swing.py, should be Scalper_Stock_...
-        value: "YOUR_SCALPER_TELEGRAM_BOT_TOKEN_HERE" # Check original file for correct name
-      - key: TELEGRAM_CHAT_ID # Used by alpaca_swing.py
-        value: "YOUR_TELEGRAM_CHAT_ID_HERE" # This is the general one for alpaca_swing
-      - key: Unholy_TELEGRAM_BOT_TOKEN # Used by alpaca_options.py
+        value: "YOUR_SCALPER_TELEGRAM_BOT_TOKEN_HERE"
+      - key: TELEGRAM_CHAT_ID
+        value: "YOUR_TELEGRAM_CHAT_ID_HERE"
+      - key: Unholy_TELEGRAM_BOT_TOKEN
         value: "YOUR_UNHOLY_TELEGRAM_BOT_TOKEN_HERE"
-      - key: TELEGRAM_USER_ID # Used by alpaca_options.py (Unholy bot)
+      - key: TELEGRAM_USER_ID
         value: "YOUR_UNHOLY_TELEGRAM_USER_ID_HERE"
       # NEW Telegram ENVs for Crypto_Genie_V6.3
-      - key: Crypto_TELEGRAM_BOT_TOKEN # As used in Crypto_Genie_V6.3
+      - key: Crypto_TELEGRAM_BOT_TOKEN
         value: "YOUR_CRYPTO_GENIE_TELEGRAM_BOT_TOKEN"
-      - key: CRYPTO_TELEGRAM_USER_ID # Specific ID for Crypto_Genie's TELEGRAM_USER_ID env
+      - key: CRYPTO_TELEGRAM_USER_ID
         value: "YOUR_CRYPTO_GENIE_PRIMARY_TELEGRAM_USER_ID"
-      - key: CRYPTO_AUTHORIZED_TELEGRAM_USER_IDS # Specific authorized IDs for Crypto_Genie
+      - key: CRYPTO_AUTHORIZED_TELEGRAM_USER_IDS
         value: "YOUR_CRYPTO_GENIE_AUTHORIZED_IDS_COMMA_SEP"
 
 services:
-  - name: webapi # Your FastAPI backend
+  - name: webapi
     type: web
     env: docker
     region: frankfurt
@@ -68,7 +64,7 @@ services:
       - fromGroup: common-db-config
     autoDeploy: yes
 
-  - name: scanners # Your scanners service
+  - name: scanners
     type: worker
     env: docker
     region: frankfurt
@@ -80,7 +76,7 @@ services:
       - fromGroup: other-api-keys
     autoDeploy: yes
 
-  - name: router # Your meta_ai service
+  - name: router
     type: worker
     env: docker
     region: frankfurt
@@ -151,12 +147,6 @@ services:
       - fromGroup: common-db-config
       - fromGroup: binance-api-keys
       - fromGroup: other-api-keys
-
-      - key: TELEGRAM_USER_ID
-        valueFrom: CRYPTO_TELEGRAM_USER_ID
-      - key: AUTHORIZED_TELEGRAM_USER_IDS
-        valueFrom: CRYPTO_AUTHORIZED_TELEGRAM_USER_IDS
-      
       - key: ROLE
         value: "crypto"
       - key: EXECUTOR_SCRIPT
