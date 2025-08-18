@@ -1,1299 +1,1053 @@
-<<<<<<< HEAD
-=======
-# Genie_stocks_Top3_v0.py - Top 20 Strategy (10 Long / 10 Short)
-# - Scans NYSE/NASDAQ based on 30-min % change.
-# - Filters by price ($1-$50) and 15-min volume (>300k).
-# - Uses previous close for initial price reference if needed.
-# - Includes extended hours support for data fetching.
-# - NOTE: Requires Alpaca SIP data plan for full universe coverage.
-# - NOTE: High API usage - adjust JOB_INTERVAL_MINUTES if hitting rate limits.
+# ==============================================================================
+# --- AUTONOMOUS TRADING ALGORITHM (Short_King.py v4.0) ---
+#
+# v4.0 UPDATE:
+# - STOP-LOSS ENABLED: A 10% stop-loss is now automatically placed for all
+#   positions. It's a virtual stop during pre-market and becomes a GTC
+#   order during regular trading hours.
+# - TRADE SIZE REDUCED: Notional trade value reduced to $1,000 per position.
+# - IMMEDIATE ENTRY: The consistency check for gappers has been removed.
+#   The bot will now attempt to enter a trade immediately after a stock
+#   gapping over 30% is detected.
+#
+# WARNING: THE AUTOMATIC END-OF-DAY POSITION CLOSING FEATURE HAS BEEN DISABLED.
+# POSITIONS WILL BE HELD OVERNIGHT UNLESS MANUALLY CLOSED.
+# ==============================================================================
 
->>>>>>> b690d80a4280774987762d719d92e88d5fe6da24
 import asyncio
 import os
-import json
-import logging
 import sys
-from datetime import datetime, timedelta, timezone, date
-from dateutil.parser import isoparse
-from collections import deque
+import logging
+from logging.handlers import RotatingFileHandler
+from datetime import datetime, time as dtime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
-# from uuid import UUID # Not used in original, can be omitted if order_id is sufficient
+from enum import Enum
+import json
 import time
-import math # For checking NaN
-import numpy as np # For ATR calculation
-import requests # For fetching gainers
+from typing import Any, Dict, List, Optional, Set
+from dataclasses import dataclass, field
+from collections import defaultdict
+from functools import partial
+from types import SimpleNamespace
 
-# --- Alpaca Imports (Using alpaca-py V2) ---
-from alpaca.trading.client import TradingClient as REST
-from alpaca.data.historical.stock import StockHistoricalDataClient
-from alpaca.trading.requests import MarketOrderRequest, GetAssetsRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass, AssetStatus, AssetExchange
-from alpaca.trading.models import Asset, Position # Added Position for fetching qty
+# --- Vendor Client Imports ---
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, StopOrderRequest, ClosePositionRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
+from alpaca.trading.models import TradeUpdate, Position, Order
+from alpaca.trading.stream import TradingStream
 from alpaca.common.exceptions import APIError
-from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest
-from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-from alpaca.data.models import Bar # Original used BarSet, Bar is fine for lists
-
-# --- Telegram Imports ---
+from polygon import RESTClient
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
-from telegram.constants import ParseMode
-import telegram.error
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# === Configuration === #
+# --- AI & Data Science Imports ---
+import numpy as np
+from openai import OpenAI
+import requests
+
+# ==============================================================================
+# --- STEP 1: CONFIGURATION & SETTINGS ---
+# ==============================================================================
+
+@dataclass
+class Settings:
+    """Centralized configuration for all trading parameters and filters."""
+    SIMULATION_MODE: bool = False
+    SIMULATED_ET_HOUR: int = 8
+
+    MIN_PRICE: float = 0.1
+    MAX_PRICE: float = 1000.0
+    MIN_AVG_DOLLAR_VOLUME: float = 100_000
+    MIN_PM_VOLUME: int = 25000
+    MIN_NOTIONAL_VALUE: float = 5_000.0
+    MAX_SHARES_OUTSTANDING: int = 50_000_000
+    MIN_ATR_PERCENT: float = 3.0
+    MAX_SPREAD_PERCENT: float = 1.5
+    MIN_GAP_PERCENT: float = 30.0
+
+    TRADE_NOTIONAL_VALUE: float = 1000.0
+    MAX_POSITIONS: int = int(os.getenv("MAX_POSITIONS", 20))
+    STOP_LOSS_PERCENT: float = 10.0
+
+    CONCURRENT_TASKS: int = 5
+    MAX_QUEUE_SIZE: int = 2000
+    TELEGRAM_HEARTBEAT_INTERVAL: int = int(os.getenv("HEARTBEAT_INTERVAL", 900))
+    GAPPER_CONSISTENCY_CHECK_SECONDS: int = 200
+
+SETTINGS = Settings()
+
+# --- Environment & Logging Setup ---
 load_dotenv()
-
-# Alpaca API Credentials (using APCA_ prefix as requested)
-APCA_API_KEY_ID = os.getenv("APCA_API_KEY_ID")
-APCA_API_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
-TELEGRAM_BOT_TOKEN = os.getenv("TOP3_Stock_TELEGRAM_BOT_TOKEN") # From original script
-
-# --- Basic Sanity Checks ---
-if not APCA_API_KEY_ID or not APCA_API_SECRET_KEY:
-    print("ERROR: Alpaca API Key ID or Secret Key not found (APCA_API_KEY_ID, APCA_API_SECRET_KEY).", file=sys.stderr)
-    sys.exit(1)
-if not TELEGRAM_BOT_TOKEN:
-    print("ERROR: TOP3_Stock_TELEGRAM_BOT_TOKEN not found.", file=sys.stderr)
-    sys.exit(1)
-
-ALPACA_PAPER_TRADING = os.getenv("ALPACA_PAPER_TRADING", "true").lower() == "true"
-
-<<<<<<< HEAD
-# --- State and Log Files (using original names for consistency with existing setup) ---
-STATE_FILE = "genie_stocks_top3_v0_state.json" # Original state file name
-LOG_FILE = "genie_stocks_top3_v0.log"     # Original log file name
-=======
-# --- Strategy Parameters ---
-TRADE_NOTIONAL_PER_STOCK = 5000
-JOB_INTERVAL_MINUTES = 2
-HOLD_TIME_LIMIT_MINUTES = 30
-EXIT_PRICE_FETCH_DELAY_SECONDS = 1.5
-MAX_LONG_POSITIONS = 10
-MAX_SHORT_POSITIONS = 10
-MAX_OPEN_POSITIONS = MAX_LONG_POSITIONS + MAX_SHORT_POSITIONS
-EXTENDED_HOURS_TRADING = True
->>>>>>> b690d80a4280774987762d719d92e88d5fe6da24
-
-# --- Strategy Parameters (NEW High-Volume Gapper Strategy) ---
-TRADE_NOTIONAL_PER_STOCK = float(os.getenv("TRADE_NOTIONAL_PER_STOCK", "5000.0"))
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3")) # New strategy: Top-3 long positions
-JOB_INTERVAL_MINUTES = int(os.getenv("JOB_INTERVAL_MINUTES", "2"))
-HOLD_TIME_LIMIT_MINUTES = int(os.getenv("HOLD_TIME_LIMIT_MINUTES", "30"))
-EXIT_PRICE_FETCH_DELAY_SECONDS = 1.5 # Kept from original for PnL on exit
-
-# ATR and Trailing Stop Configuration (NEW)
-ATR_TIMEFRAME_MINUTES = int(os.getenv("ATR_TIMEFRAME_MINUTES", "5"))
-ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
-ATR_INITIAL_SL_MULTIPLIER = float(os.getenv("ATR_INITIAL_SL_MULTIPLIER", "1.5"))
-TRAIL_ACTIVATION_PROFIT_ATR = float(os.getenv("TRAIL_ACTIVATION_PROFIT_ATR", "1.0")) # ATRs in profit
-TRAIL_OFFSET_ATR = float(os.getenv("TRAIL_OFFSET_ATR", "1.0")) # ATRs to trail
-
-# Filtering Parameters (NEW Strategy)
-GAINERS_ENDPOINT_URL = os.getenv("GAINERS_ENDPOINT_URL", "http://localhost:8000/gainers") # Placeholder
-MIN_RELATIVE_VOLUME_FOR_ENTRY = float(os.getenv("MIN_RELATIVE_VOLUME_FOR_ENTRY", "3.0"))
-PRICE_FILTER_MIN = float(os.getenv("PRICE_FILTER_MIN", "1.0"))
-PRICE_FILTER_MAX = float(os.getenv("PRICE_FILTER_MAX", "100.0")) # Increased max price for gappers
-
-EXTENDED_HOURS_TRADING = os.getenv("EXTENDED_HOURS_TRADING", "true").lower() == "true" # From original
-
-# === Setup Logging === #
-logging.basicConfig(
-    level=logging.INFO, # Changed from DEBUG
-    format='%(asctime)s - %(levelname)s - [%(funcName)s:%(lineno)d] - %(message)s',
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding='utf-8'),
-        logging.StreamHandler(sys.stdout)
-    ],
-    encoding='utf-8'
-)
-<<<<<<< HEAD
-logging.info(f"--- BOT START (High-Volume Gapper Strategy MODIFIED from Genie_stocks_Top3_v0) ---")
-logging.info(f"PAPER_TRADING: {ALPACA_PAPER_TRADING}")
-logging.info(f"Trade Notional: ${TRADE_NOTIONAL_PER_STOCK}, Max Positions (Long Only): {MAX_POSITIONS}")
-logging.info(f"ATR Config: {ATR_PERIOD}P on {ATR_TIMEFRAME_MINUTES}min bars. Init SL: {ATR_INITIAL_SL_MULTIPLIER}x ATR.")
-logging.info(f"Trailing Stop: Activates at {TRAIL_ACTIVATION_PROFIT_ATR} ATRs gain, trails by {TRAIL_OFFSET_ATR} ATRs.")
-logging.info(f"Job Interval: {JOB_INTERVAL_MINUTES} min, Hold Limit: {HOLD_TIME_LIMIT_MINUTES} min")
-logging.info(f"Filters: Price ${PRICE_FILTER_MIN}-${PRICE_FILTER_MAX}, Min Rel Vol: {MIN_RELATIVE_VOLUME_FOR_ENTRY}x")
-logging.info(f"Extended Hours Data Fetching: {EXTENDED_HOURS_TRADING}")
-=======
-logging.info(f"-------------------- BOT START (Top20_v0 - 30min Change) --------------------")
-logging.info(f"PAPER_TRADING: {PAPER_TRADING}")
-logging.info(
-    f"Trade Notional: ${TRADE_NOTIONAL_PER_STOCK}, "
-    f"Max Long: {MAX_LONG_POSITIONS}, Max Short: {MAX_SHORT_POSITIONS}, "
-    f"Hold Limit: {HOLD_TIME_LIMIT_MINUTES} min"
-)
-logging.info(f"Job Interval: {JOB_INTERVAL_MINUTES} min, Extended Hours Data: {EXTENDED_HOURS_TRADING}")
-logging.info(f"Filters: Price ${MIN_PRICE_FILTER}-${MAX_PRICE_FILTER}, Min Volume ({VOLUME_LOOKBACK_MINUTES}min): {MIN_VOLUME_FILTER}, Ranking Lookback: {RANKING_LOOKBACK_MINUTES}min")
-logging.warning("Ensure you have an adequate Alpaca data plan (SIP recommended) for full NYSE/NASDAQ scanning.")
->>>>>>> b690d80a4280774987762d719d92e88d5fe6da24
-
-
-# === Global State & Data Structures (as per original script) ===
-state = {} # Loaded by load_state()
-active_assets_cache = [] # Maintained as original, though less critical for new scan
-last_assets_fetch_time = None
-state_lock = asyncio.Lock() # For async operations (Telegram handlers) modifying shared state
-
-# === Initialize Alpaca V2 Clients (as per original script) ===
-try:
-    rest_client = REST(APCA_API_KEY_ID, APCA_API_SECRET_KEY, paper=ALPACA_PAPER_TRADING)
-    data_client = StockHistoricalDataClient(APCA_API_KEY_ID, APCA_API_SECRET_KEY)
-    account_info = rest_client.get_account()
-    logging.info(f"Alpaca clients initialized. Account Status: {account_info.status}, Buying Power: {account_info.buying_power}")
-except APIError as e:
-    logging.critical(f"Failed to initialize Alpaca clients or connect: {e}", exc_info=True)
-    sys.exit(1)
-except Exception as e:
-    logging.critical(f"An unexpected error occurred during Alpaca client initialization: {e}", exc_info=True)
-    sys.exit(1)
-
-# === Helper Functions (Adapted/Merged) ===
-def now_utc() -> datetime: # Consistent naming
-    """Returns the current UTC datetime."""
-    return datetime.now(timezone.utc)
-
-def load_state_original(): # Explicitly named to match its origin for clarity
-    """Loads state from JSON file, ensuring default structure (original pattern)."""
-    global state # Operates on global state
-    default_state_struct = {"trades": [], "pnl": [], "strategy_enabled": {}, "goals": {}}
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding='utf-8') as f:
-                loaded_data = json.load(f)
-            for key, default_value in default_state_struct.items():
-                loaded_data.setdefault(key, default_value) # Ensure all keys exist
-            # Specific new strategy fields within each trade dict will be handled in run_strategy_cycle
-            state = loaded_data
-            logging.info(f"Successfully loaded state from {STATE_FILE}")
-        except json.JSONDecodeError:
-            logging.error(f"Error decoding state JSON from {STATE_FILE}. Initializing.", exc_info=True)
-            state = default_state_struct
-        except Exception as e:
-            logging.error(f"Error loading state file {STATE_FILE}: {e}. Initializing.", exc_info=True)
-            state = default_state_struct
-    else:
-        logging.warning(f"State file {STATE_FILE} not found. Initializing.")
-        state = default_state_struct
-    return state # Return the global state
-
-def save_state_original(state_to_save_param=None): # Explicit name, param for clarity
-    """Saves the current global state (or provided dict) to a JSON file (original pattern)."""
-    data_to_save = state_to_save_param if state_to_save_param is not None else state
-    try:
-        # Ensure datetimes are stringified for JSON
-        state_copy = json.loads(json.dumps(data_to_save, default=str))
-        with open(STATE_FILE, "w", encoding='utf-8') as f:
-            json.dump(state_copy, f, indent=4)
-        logging.debug(f"State successfully saved to {STATE_FILE}")
-    except Exception as e:
-        logging.error(f"Error saving state to {STATE_FILE}: {e}", exc_info=True)
-
-state = load_state_original() # Initial load into global state
-
-def execute_trade_original(symbol: str, side: OrderSide, qty: float = None, notional: float = None) -> str | None:
-    """Submits a market order to Alpaca (original pattern)."""
-    order_data = None; log_action = ""
-    try:
-        if side == OrderSide.BUY and notional is not None:
-            order_data = MarketOrderRequest(symbol=symbol, notional=notional, side=side, time_in_force=TimeInForce.DAY)
-            log_action = f"BUY {symbol} (Notional: ${notional})"
-        elif side == OrderSide.SELL and qty is not None and qty > 0 : # Qty must be positive
-            order_data = MarketOrderRequest(symbol=symbol, qty=abs(float(qty)), side=side, time_in_force=TimeInForce.DAY)
-            log_action = f"SELL {symbol} (Qty: {abs(float(qty))})"
-<<<<<<< HEAD
-        # Original script's SELL with notional implies shorting, new strategy is long-only for entries.
-        # This function will now primarily be used for BUY entries and SELL (to close long) exits.
-        else:
-            raise ValueError(f"Invalid parameters for execute_trade: side={side}, qty={qty}, notional={notional}")
-        
-=======
-        elif side == OrderSide.SELL and notional is not None:
-            order_data = MarketOrderRequest(symbol=symbol, notional=notional, side=side, time_in_force=TimeInForce.DAY)
-            log_action = f"SELL {symbol} (Notional: ${notional})"
-        else:
-            raise ValueError("Invalid parameters for execute_trade: Need (notional for BUY) or (qty/notional for SELL).")
->>>>>>> b690d80a4280774987762d719d92e88d5fe6da24
-        logging.info(f"Attempting order: {log_action}")
-        trade_order = rest_client.submit_order(order_data=order_data)
-        logging.info(f"Order submitted for {log_action}. Order ID: {trade_order.id}")
-        return str(trade_order.id)
-    except APIError as e: logging.error(f"Alpaca API error submitting order for {log_action}: {e}"); return None # No raise, return None
-    except ValueError as e: logging.error(f"Value error preparing order for {log_action}: {e}"); return None
-    except Exception as e: logging.error(f"Generic error submitting order for {log_action}: {e}", exc_info=True); return None
-
-
-def get_active_assets_original() -> list[str]:
-    """ Fetches and caches active, tradable US equities (original pattern). """
-    global active_assets_cache, last_assets_fetch_time
-    today = date.today()
-    if last_assets_fetch_time == today and active_assets_cache:
-        logging.debug(f"Using cached active asset list for {today}.")
-        return active_assets_cache
-
-    logging.info("Refreshing active NYSE & NASDAQ asset list...")
-    all_assets_list: list[Asset] = []
-    # Original script fetched per exchange, this can be simplified if not strictly needed
-    try:
-        asset_params = GetAssetsRequest(asset_class=AssetClass.US_EQUITY, status=AssetStatus.ACTIVE)
-        # Fetching all active US equities, then filtering locally if specific exchanges are desired.
-        # Or, if original per-exchange fetch is mandatory:
-        # for exchange_enum in [AssetExchange.NYSE, AssetExchange.NASDAQ]:
-        #     asset_params = GetAssetsRequest(asset_class=AssetClass.US_EQUITY, status=AssetStatus.ACTIVE, exchange=exchange_enum)
-        #     all_assets_list.extend(rest_client.get_all_assets(asset_params))
-        all_assets_list = rest_client.get_all_assets(asset_params)
-        
-        tradable_symbols = {
-            a.symbol for a in all_assets_list 
-            if a.tradable and '.' not in a.symbol and '/' not in a.symbol and
-            (a.exchange in [AssetExchange.NYSE, AssetExchange.NASDAQ, AssetExchange.ARCA, AssetExchange.BATS] or str(a.exchange) in ["NYSE", "NASDAQ", "ARCA", "BATS"]) # Cover enums and strings
-        }
-        active_symbols = sorted(list(tradable_symbols))
-<<<<<<< HEAD
-        logging.info(f"Fetched {len(all_assets_list)} assets, filtered to {len(active_symbols)} tradable symbols on major exchanges.")
-        active_assets_cache = active_symbols
-        last_assets_fetch_time = today
-=======
-        count_after = len(active_symbols)
-        logging.info(f"Fetched total {count_before} assets across specified exchanges, filtered to {count_after} unique tradable US Equity symbols.")
-
-        if active_symbols:
-            active_assets_cache = active_symbols
-            last_assets_fetch_time = today
-        else:
-            logging.warning("No active tradable symbols found.")
-            return active_assets_cache if active_assets_cache else []
-
-    except APIError as e: logging.error(f"API error fetching asset list: {e}. Returning cache."); return active_assets_cache or []
-    except AttributeError as e: logging.critical(f"AttributeError fetching asset list: {e}. Method missing?", exc_info=True); return active_assets_cache or []
-    except Exception as e: logging.error(f"Error fetching asset list: {e}. Returning cache.", exc_info=True); return active_assets_cache or []
-
-    return active_symbols
-
-
-def get_latest_trades_batched(symbols: list[str], batch_size: int = 500) -> dict[str, float]:
-    """Fetches latest trades in batches."""
-    latest_prices = {}; symbols_processed = 0
-    logging.info(f"Fetching latest trades for {len(symbols)} symbols in batches of {batch_size}...")
-    for i in range(0, len(symbols), batch_size):
-        batch = symbols[i:i+batch_size]
-        try:
-            req = StockLatestTradeRequest(symbol_or_symbols=batch, feed='sip')
-            latest_trades = data_client.get_stock_latest_trade(req)
-            for symbol, trade in latest_trades.items():
-                if trade.price > 0: latest_prices[symbol] = trade.price
-            symbols_processed += len(batch)
-            logging.debug(f"Fetched latest trades batch {i//batch_size + 1}, processed {symbols_processed}/{len(symbols)}. Got {len(latest_trades)} prices.")
-            time.sleep(0.1)
-        except APIError as e:
-            if e.status_code == 429: logging.warning(f"Rate limit hit fetching latest trades batch (start index {i}). {e}")
-            else: logging.error(f"API error fetching latest trades batch (start index {i}): {e}")
-        except Exception as e: logging.error(f"Error fetching latest trades batch (start index {i}): {e}", exc_info=True)
-    logging.info(f"Finished fetching latest trades. Total valid prices retrieved: {len(latest_prices)}")
-    return latest_prices
-
-def get_bars_batched(symbols: list[str], timeframe: TimeFrame, start: datetime, end: datetime, batch_size: int = 200) -> dict:
-    """Fetches historical bars in batches."""
-    all_bars_data = {}; symbols_processed = 0
-    logging.info(f"Fetching {timeframe.value} bars for {len(symbols)} symbols from {start.isoformat()} to {end.isoformat()} in batches of {batch_size}...")
-    start = start.astimezone(timezone.utc); end = end.astimezone(timezone.utc)
-    start_iso = start.isoformat(); end_iso = end.isoformat()
-    for i in range(0, len(symbols), batch_size):
-        batch = symbols[i:i+batch_size]
-        if not batch: continue
-        try:
-            request_params = StockBarsRequest(symbol_or_symbols=batch, timeframe=timeframe, start=start_iso, end=end_iso, adjustment='raw', feed='sip')
-            barset = data_client.get_stock_bars(request_params)
-            all_bars_data.update(barset.data)
-            symbols_processed += len(batch)
-            logging.debug(f"Fetched bars batch {i//batch_size + 1}, processed {symbols_processed}/{len(symbols)}. Got data for {len(barset.data)}.")
-            time.sleep(0.1)
-        except APIError as e:
-            if e.status_code == 429: logging.warning(f"Rate limit hit fetching bars batch (start index {i}). {e}")
-            elif e.status_code == 422: logging.warning(f"Unprocessable entity (422) fetching bars batch (start index {i}). {e}")
-            else: logging.error(f"API error fetching bars batch (start index {i}): {e}")
-        except Exception as e: logging.error(f"Error fetching bars batch (start index {i}): {e}", exc_info=True)
-    logging.info(f"Finished fetching bars. Total symbols with data: {len(all_bars_data)}")
-    return all_bars_data
-
-
-def scan_market_30min_change() -> list[dict]:
-    """Scans NYSE/NASDAQ assets, filters, ranks by 30-min % change."""
-    logging.info("--- Starting Market Scan (30-Min Change, Price/Volume Filters) ---")
-    scan_start_time = time.time()
-
-    all_active_symbols = get_active_assets()
-    if not all_active_symbols: logging.warning("Scan aborted: No active symbols found."); return []
-    logging.info(f"Starting scan with {len(all_active_symbols)} active symbols.")
-
-    latest_prices = get_latest_trades_batched(all_active_symbols)
-    if not latest_prices: logging.warning("Scan aborted: Could not fetch any latest prices."); return []
-
-    price_filtered_symbols = { s: p for s, p in latest_prices.items() if MIN_PRICE_FILTER <= p <= MAX_PRICE_FILTER }
-    logging.info(f"Price Filter Applied: {len(price_filtered_symbols)} symbols remaining.")
-    if not price_filtered_symbols: logging.warning("Scan aborted: No symbols passed price filter."); return []
-
-    now_utc = datetime.now(timezone.utc)
-    volume_start_time = now_utc - timedelta(minutes=VOLUME_LOOKBACK_MINUTES + 5); volume_end_time = now_utc
-    volume_bars_data = get_bars_batched(list(price_filtered_symbols.keys()), TimeFrame.Minute, volume_start_time, volume_end_time)
-
-    volume_filtered_symbols_set = set(); volume_data = {}
-    volume_calc_start_time = now_utc - timedelta(minutes=VOLUME_LOOKBACK_MINUTES)
-    for symbol, bars in volume_bars_data.items():
-        recent_bars = [b for b in bars if b.timestamp >= volume_calc_start_time]
-        if not recent_bars: continue
-        total_volume = sum(b.volume for b in recent_bars)
-        volume_data[symbol] = total_volume
-        if total_volume >= MIN_VOLUME_FILTER: volume_filtered_symbols_set.add(symbol)
-
-    logging.info(f"Volume Filter Applied: {len(volume_filtered_symbols_set)} symbols remaining.")
-    if not volume_filtered_symbols_set: logging.warning("Scan aborted: No symbols passed volume filter."); return []
-
-    ranking_start_time = now_utc - timedelta(minutes=RANKING_LOOKBACK_MINUTES + 5); ranking_end_time = now_utc
-    ranking_bars_data = get_bars_batched(list(volume_filtered_symbols_set), TimeFrame.Minute, ranking_start_time, ranking_end_time)
-
-    ranks = []; target_time_30_min_ago = now_utc - timedelta(minutes=RANKING_LOOKBACK_MINUTES)
-    for symbol in volume_filtered_symbols_set:
-        current_price = price_filtered_symbols.get(symbol)
-        if not current_price: continue
-        bars = ranking_bars_data.get(symbol, [])
-        if not bars: continue
-        price_30_min_ago = None; bars.sort(key=lambda b: b.timestamp)
-        ref_bar = next((b for b in reversed(bars) if b.timestamp <= target_time_30_min_ago), None)
-        if ref_bar: price_30_min_ago = ref_bar.close
-        else: continue
-        try: price_30_min_ago = float(price_30_min_ago); current_price = float(current_price)
-        except: logging.warning(f"Price conversion error for {symbol}. Skipping."); continue
-        if price_30_min_ago > 0 and current_price > 0:
-            try:
-                percent_change = ((current_price - price_30_min_ago) / price_30_min_ago) * 100
-                if math.isnan(percent_change) or math.isinf(percent_change): continue
-                if -99 < percent_change < 500:
-                     ranks.append({'symbol': symbol, 'change': percent_change, 'price': current_price, 'volume_15m': volume_data.get(symbol, 0)})
-            except ZeroDivisionError: logging.warning(f"ZeroDivisionError for {symbol}.")
-            except Exception as e: logging.error(f"Ranking calc error for {symbol}: {e}")
-
-    ranks.sort(key=lambda x: x['change'], reverse=True)
-    scan_duration = time.time() - scan_start_time
-    logging.info(f"Ranking complete. Total ranked: {len(ranks)}. Duration: {scan_duration:.2f} sec.")
-    top_performers_log = [f"{r['symbol']}({r['change']:.2f}%)" for r in ranks[:10]]
-    logging.info(f"Top {min(10, len(ranks))} performers: {', '.join(top_performers_log)}")
-    return ranks
-
-
-# === Core Strategy Logic (Synchronous Function - Returns Actions) === #
-def run_strategy_cycle():
-    """Runs one cycle of the trading strategy."""
-    logging.info("--- Starting Strategy Cycle (Top3_v0) ---")
-    global state; actions_by_user = {}
-
-    try: # Check Market Status
-        clock = rest_client.get_clock(); now_utc = datetime.now(timezone.utc); allow_run = False
-        status_log = f"Clock: open={clock.is_open}, next_open={clock.next_open.isoformat()}, next_close={clock.next_close.isoformat()}"
-        if clock.is_open: allow_run = True; logging.info(f"Market open. {status_log}")
-        elif EXTENDED_HOURS_TRADING: allow_run = True; logging.info(f"Market closed, EXTENDED_HOURS enabled. {status_log}")
-        else: logging.info(f"Market closed, EXTENDED_HOURS disabled. Skipping. {status_log}")
-        if not allow_run: return actions_by_user
-    except Exception as e: logging.error(f"Market status check failed: {e}", exc_info=True); return actions_by_user
-
-    ranks = scan_market_30min_change()  # Scan Market
-    if not ranks:
-        logging.warning("Scan returned no ranks. Aborting cycle.")
-        return actions_by_user
-
-    long_candidates = [r for r in ranks if r['change'] > 0][:MAX_LONG_POSITIONS]
-    short_candidates = sorted(
-        [r for r in ranks if r['change'] < 0], key=lambda x: x['change']
-    )[:MAX_SHORT_POSITIONS]
-
-    current_top_performers = long_candidates + short_candidates
-    current_top_symbols = {r['symbol'] for r in current_top_performers}
-    top_log_str = [f"{r['symbol']}({r['change']:.2f}%)" for r in current_top_performers]
-    logging.info(
-        f"Current Top {len(current_top_symbols)} (30min %): {', '.join(top_log_str)}"
-    )
-
-    enabled_users = list(uid for uid, enabled in state.get("strategy_enabled", {}).items() if enabled)
-    if not enabled_users: logging.info("No users enabled."); return actions_by_user
-    logging.info(f"Processing for {len(enabled_users)} enabled user(s): {enabled_users}")
-
-    try: # Get Positions
-        all_positions = rest_client.get_all_positions()
-        positions_map = {p.symbol: p for p in all_positions}
-        logging.debug(f"Fetched {len(positions_map)} open Alpaca positions.")
-    except Exception as e: logging.error(f"Failed fetching positions: {e}", exc_info=True); return actions_by_user
-
-    for user_id in enabled_users: # Process Each User
-        user_actions = []
-        try:
-            logging.debug(f"Processing User ID: {user_id}")
-            open_trades_state = {
-                t['symbol']: t
-                for t in state.get("trades", [])
-                if t.get("user") == user_id and t.get("status") == "open"
-            }
-            held_symbols_in_state = set(open_trades_state.keys())
-            held_long = {s for s, t in open_trades_state.items() if t.get("side") != "short"}
-            held_short = {s for s, t in open_trades_state.items() if t.get("side") == "short"}
-            logging.debug(
-                f"User {user_id} Held (long:{len(held_long)} short:{len(held_short)}): {held_symbols_in_state}"
-            )
-
-            # Sync State
-            mismatched = {s for s in held_symbols_in_state if s not in positions_map}
-            if mismatched:
-                logging.warning(f"User {user_id} - Sync Discrepancy (State shows open, Alpaca doesn't): {mismatched}")
-                indices = [i for i, t in enumerate(state["trades"]) if t.get("user") == user_id and t.get("symbol") in mismatched and t.get("status") == "open"]
-                for idx in indices: state["trades"][idx].update({"status": "closed_orphan", "exit_time": datetime.now(timezone.utc).isoformat(), "exit_reason": "Orphan"})
-                open_trades_state = {k: v for k, v in open_trades_state.items() if k not in mismatched}
-                held_symbols_in_state = set(open_trades_state.keys())
-
-            # Check Exits
-            symbols_to_sell = set(); sell_reasons = {}; now_dt = datetime.now(timezone.utc)
-            for symbol in held_symbols_in_state:
-                trade_info = open_trades_state.get(symbol); exit_reason = None
-                if not trade_info: continue
-                if symbol not in current_top_symbols: exit_reason = "Displaced (30min)"
-                elif trade_info.get('executed_at'):
-                    try:
-                        if (now_dt - isoparse(trade_info['executed_at'])) >= timedelta(minutes=HOLD_TIME_LIMIT_MINUTES): exit_reason = f">{HOLD_TIME_LIMIT_MINUTES}min Hold"
-                    except ValueError: logging.warning(f"Bad entry time format for {symbol}")
-                if exit_reason: logging.info(f"User {user_id} - Exit Trigger: {symbol} ({exit_reason})"); symbols_to_sell.add(symbol); sell_reasons[symbol] = exit_reason
-
-            # Execute Sells
-            if symbols_to_sell:
-                logging.info(f"User {user_id} - Selling: {symbols_to_sell}")
-                sell_time = datetime.now(timezone.utc)
-                for symbol in symbols_to_sell:
-                    trade_info = open_trades_state.get(symbol)
-                    position = positions_map.get(symbol)
-                    if not trade_info or not position:
-                        logging.warning(f"Missing info for sell {symbol}")
-                        continue
-                    try:
-                        qty = abs(float(position.qty))
-                        if qty > 0:
-                            exit_side = OrderSide.BUY if trade_info.get("side") == "short" else OrderSide.SELL
-                            exit_id = execute_trade(symbol=symbol, side=exit_side, qty=qty)
-                            time.sleep(EXIT_PRICE_FETCH_DELAY_SECONDS); exit_price = None
-                            try: req = StockLatestTradeRequest(symbol_or_symbols=symbol, feed='sip'); snap = data_client.get_stock_latest_trade(req); exit_price = snap[symbol].price if symbol in snap and snap[symbol].price > 0 else trade_info.get('entry_price')
-                            except Exception as e: logging.error(f"Exit price fetch failed for {symbol}: {e}"); exit_price = trade_info.get('entry_price')
-                            try: exit_price = float(exit_price) if exit_price is not None else float(trade_info.get('entry_price', 0))
-                            except: exit_price = float(trade_info.get('entry_price', 0))
-                            idx = next((i for i, t in enumerate(state["trades"]) if t.get("user") == user_id and str(t.get("trade_id")) == str(trade_info.get("trade_id")) and t.get("status") == "open"), -1)
-                            profit, pct = 0.0, 0.0
-                            if idx != -1:
-                                entry_px = float(state["trades"][idx].get("entry_price", 0))
-                                state["trades"][idx].update({"status": "closed", "exit_price": exit_price, "exit_time": sell_time.isoformat(), "exit_id": exit_id, "exit_reason": sell_reasons.get(symbol)})
-                                if entry_px > 0 and exit_price > 0:
-                                    if trade_info.get("side") == "short":
-                                        profit = (entry_px - exit_price) * qty
-                                        pct = ((entry_px - exit_price) / entry_px) * 100
-                                    else:
-                                        profit = (exit_price - entry_px) * qty
-                                        pct = ((exit_price - entry_px) / entry_px) * 100
-                                pnl = {"user": user_id, "symbol": symbol, "profit": round(profit, 2), "pct_change": round(pct, 2), "time": sell_time.isoformat(), "entry_price": entry_px, "exit_price": exit_price, "entry_trade_id": trade_info.get("trade_id"), "exit_trade_id": exit_id, "exit_reason": sell_reasons.get(symbol)}
-                                state.setdefault("pnl", []).append(pnl)
-                                logging.info(
-                                    f"User {user_id} - Closed {symbol}: PnL ${profit:.2f} ({pct:.2f}%) Reason: {sell_reasons.get(symbol)}"
-                                )
-                                user_actions.append({"action": "SELL", "symbol": symbol, "reason": sell_reasons.get(symbol), "price": exit_price, "pnl": round(profit, 2), "pct": round(pct, 2)})
-                            else: logging.error(f"State update failed for closed {symbol}")
-                        else: logging.warning(f"Alpaca position qty for {symbol} was 0. Marking closed."); idx = next((i for i, t in enumerate(state["trades"]) if t.get("user") == user_id and str(t.get("trade_id")) == str(trade_info.get("trade_id")) and t.get("status") == "open"), -1); state["trades"][idx].update({"status": "closed_zero_qty", "exit_reason": "Zero quantity found"}) if idx != -1 else None
-                    except APIError as e: logging.error(f"API error selling {symbol}: {e}"); idx = next((i for i, t in enumerate(state["trades"]) if t.get("user") == user_id and str(t.get("trade_id")) == str(trade_info.get("trade_id")) and t.get("status") == "open"), -1); state["trades"][idx].update({"status": "closed_orphan", "exit_reason": f"Sell failed ({e.status_code})"}) if idx != -1 and e.status_code == 404 else None
-                    except Exception as e: logging.error(f"Generic error closing {symbol}: {e}", exc_info=True)
-
-            # Execute Buys (Long & Short)
-            open_trades_state = {
-                t['symbol']: t
-                for t in state.get("trades", [])
-                if t.get("user") == user_id and t.get("status") == "open"
-            }
-            held_long = {s for s, t in open_trades_state.items() if t.get("side") != "short"}
-            held_short = {s for s, t in open_trades_state.items() if t.get("side") == "short"}
-            num_can_long = MAX_LONG_POSITIONS - len(held_long)
-            num_can_short = MAX_SHORT_POSITIONS - len(held_short)
-
-            symbols_long = {r['symbol'] for r in long_candidates} - held_long
-            symbols_short = {r['symbol'] for r in short_candidates} - held_short
-
-            if (symbols_long and num_can_long > 0) or (symbols_short and num_can_short > 0):
-                logging.info(
-                    f"User {user_id} - Evaluating entries L{num_can_long} S{num_can_short}: {symbols_long | symbols_short}"
-                )
-                buy_time = datetime.now(timezone.utc)
-
-                for rank in long_candidates:
-                    symbol = rank['symbol']
-                    if symbol in symbols_long and num_can_long > 0:
-                        if symbol in held_long:
-                            continue
-                        try:
-                            price = rank['price']
-                            if price <= 0:
-                                continue
-                            logging.info(f"User {user_id} - Executing BUY {symbol} @ ~${price:.2f}")
-                            order_id = execute_trade(symbol=symbol, side=OrderSide.BUY, notional=TRADE_NOTIONAL_PER_STOCK)
-                            new = {
-                                "user": user_id,
-                                "symbol": symbol,
-                                "notional": TRADE_NOTIONAL_PER_STOCK,
-                                "side": "long",
-                                "executed_at": buy_time.isoformat(),
-                                "entry_price": price,
-                                "trade_id": order_id,
-                                "status": "open",
-                            }
-                            state.setdefault("trades", []).append(new)
-                            num_can_long -= 1
-                            held_long.add(symbol)
-                            logging.info(
-                                f"User {user_id} - Entered {symbol} Order ID: {order_id}"
-                            )
-                            user_actions.append({"action": "BUY", "symbol": symbol, "price": price})
-                        except APIError as e:
-                            logging.error(f"API error buying {symbol}: {e}", exc_info=False)
-                            reason = f"API Error {e.status_code}"
-                            if e.status_code == 403:
-                                reason = "Forbidden/Funds"
-                                break
-                            elif e.status_code == 422:
-                                reason = "Not Tradable"
-                            user_actions.append({"action": "BUY_FAIL", "symbol": symbol, "reason": reason})
-                        except Exception as e:
-                            logging.error(f"Failed buy execution for {symbol}: {e}", exc_info=True)
-                            user_actions.append({"action": "BUY_FAIL", "symbol": symbol, "reason": "Exec Error"})
-
-                for rank in short_candidates:
-                    symbol = rank['symbol']
-                    if symbol in symbols_short and num_can_short > 0:
-                        if symbol in held_short:
-                            continue
-                        try:
-                            price = rank['price']
-                            if price <= 0:
-                                continue
-                            logging.info(f"User {user_id} - Executing SHORT {symbol} @ ~${price:.2f}")
-                            order_id = execute_trade(symbol=symbol, side=OrderSide.SELL, notional=TRADE_NOTIONAL_PER_STOCK)
-                            new = {
-                                "user": user_id,
-                                "symbol": symbol,
-                                "notional": TRADE_NOTIONAL_PER_STOCK,
-                                "side": "short",
-                                "executed_at": buy_time.isoformat(),
-                                "entry_price": price,
-                                "trade_id": order_id,
-                                "status": "open",
-                            }
-                            state.setdefault("trades", []).append(new)
-                            num_can_short -= 1
-                            held_short.add(symbol)
-                            logging.info(
-                                f"User {user_id} - Entered SHORT {symbol} Order ID: {order_id}"
-                            )
-                            user_actions.append({"action": "SHORT", "symbol": symbol, "price": price})
-                        except APIError as e:
-                            logging.error(f"API error shorting {symbol}: {e}", exc_info=False)
-                            reason = f"API Error {e.status_code}"
-                            if e.status_code == 403:
-                                reason = "Forbidden/Funds"
-                                break
-                            elif e.status_code == 422:
-                                reason = "Not Tradable"
-                            user_actions.append({"action": "BUY_FAIL", "symbol": symbol, "reason": reason})
-                        except Exception as e:
-                            logging.error(f"Failed short execution for {symbol}: {e}", exc_info=True)
-                            user_actions.append({"action": "BUY_FAIL", "symbol": symbol, "reason": "Exec Error"})
-        except Exception as loop_err: logging.error(f"Error in user loop {user_id}: {loop_err}", exc_info=True)
-        if user_actions: actions_by_user[user_id] = user_actions
-
-    save_state(state) # Save State
-    logging.info("--- Strategy Cycle Finished ---")
-    return actions_by_user
-
-
-# === Async Job Callback === #
-async def top_3_strategy_job_callback(context: ContextTypes.DEFAULT_TYPE):
-    """Async callback for JobQueue."""
-    logging.info("JobQueue triggered: Running strategy cycle in thread.")
-    bot = context.bot; actions_by_user = {}
-    try:
-        actions_by_user = await asyncio.to_thread(run_strategy_cycle)
->>>>>>> b690d80a4280774987762d719d92e88d5fe6da24
-    except Exception as e:
-        logging.error(f"Error fetching/filtering active assets: {e}. Using previous cache if available.", exc_info=True)
-    return active_assets_cache
-
-
-def fetch_current_price_adapted(symbol: str) -> float | None:
-    """Fetches latest trade price using data_client and StockLatestTradeRequest."""
-    try:
-        req = StockLatestTradeRequest(symbol_or_symbols=symbol, feed='sip')
-        latest_trades = data_client.get_stock_latest_trade(req)
-        trade = latest_trades.get(symbol)
-        return float(trade.price) if trade and trade.price > 0 else None
-    except Exception as e:
-        logging.error(f"Error fetch_current_price for {symbol}: {e}")
-        return None
-
-def fetch_bars_for_atr_adapted(symbol: str, limit_bars: int = ATR_PERIOD + 50) -> list[Bar]: # Ensure return type matches usage
-    """Fetches bars for ATR using data_client and StockBarsRequest."""
-    end_dt = now_utc()
-    # Estimate start date; go back more days to ensure enough bars for the given timeframe
-    days_to_go_back = max(10, (limit_bars * ATR_TIMEFRAME_MINUTES) // (6.5 * 60) + 5) # Approx trading days needed
-    start_dt = end_dt - timedelta(days=days_to_go_back)
-
-    tf_unit = TimeFrameUnit.Minute
-    tf_amount = ATR_TIMEFRAME_MINUTES
-    if ATR_TIMEFRAME_MINUTES >= 1440: tf_unit=TimeFrameUnit.Day; tf_amount = ATR_TIMEFRAME_MINUTES // 1440
-    elif ATR_TIMEFRAME_MINUTES >= 60: tf_unit=TimeFrameUnit.Hour; tf_amount = ATR_TIMEFRAME_MINUTES // 60
-
-    req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame(tf_amount, tf_unit),
-                           start=start_dt, end=end_dt, limit=limit_bars, feed='sip', adjustment='raw')
-    try:
-        barset = data_client.get_stock_bars(req)
-        return barset.data.get(symbol, [])
-    except Exception as e:
-        logging.error(f"Error fetch_bars_for_atr for {symbol}: {e}")
-        return []
-
-def calculate_atr_from_bars(bars: list[Bar], period: int = ATR_PERIOD) -> float | None:
-    """Calculates ATR from a list of Alpaca Bar objects."""
-    if not bars or len(bars) < period : return None
-    highs = np.array([b.high for b in bars]); lows = np.array([b.low for b in bars]); closes = np.array([b.close for b in bars])
-    tr = np.zeros(len(bars))
-    if len(bars) > 0: tr[0] = highs[0] - lows[0] # Max with 0 to avoid negative TR if H < L (bad data)
-    for i in range(1, len(bars)):
-        hl = highs[i] - lows[i]
-        h_cp = abs(highs[i] - closes[i-1]) if closes[i-1] is not None else hl
-        l_cp = abs(lows[i] - closes[i-1]) if closes[i-1] is not None else hl
-        tr[i] = max(hl, h_cp, l_cp)
-    if len(tr) < period: return None
-    atr_val = np.mean(tr[-period:]) # SMA of TR
-    return float(atr_val) if atr_val > 0 else None
-
-
-def fetch_top_volume_gainers_simulated_adapted() -> list[dict]:
-    """Simulates fetching top gainers with 'symbol', 'price', 'relative_volume'."""
-    logging.debug(f"Simulating fetch from GAINERS_ENDPOINT_URL: {GAINERS_ENDPOINT_URL}")
-    # This would be an actual HTTP request in a real bot
-    # try:
-    #     response = requests.get(GAINERS_ENDPOINT_URL, timeout=10)
-    #     response.raise_for_status()
-    #     gainers_data = response.json() # Expects list of {'symbol': str, 'price': float, 'relative_volume': float}
-    #     gainers_data.sort(key=lambda x: x.get('relative_volume', 0), reverse=True) # Sort by rel_vol
-    #     return gainers_data
-    # except Exception as e:
-    #     logging.error(f"Could not fetch actual gainers: {e}")
-    #     return []
-    simulated_data = [
-        {'symbol': 'AAPL', 'price': 170.0, 'relative_volume': 5.2}, {'symbol': 'MSFT', 'price': 330.0, 'relative_volume': 4.1},
-        {'symbol': 'NVDA', 'price': 750.0, 'relative_volume': 7.5}, {'symbol': 'AMD',  'price': 110.0, 'relative_volume': 6.0},
-        {'symbol': 'GOOG', 'price': 150.0, 'relative_volume': 3.5},
-    ]
-    simulated_data.sort(key=lambda x: x.get('relative_volume', 0), reverse=True)
-    return simulated_data
-
-
-def scan_and_filter_candidates() -> list[dict]:
-    """Scans for high-volume gappers, filters, and calculates ATR."""
-    logging.info("Scanning for Top-3 High-Volume Gapper candidates...")
-    raw_gainers = fetch_top_volume_gainers_simulated_adapted()
-    
-    qualified_candidates = []
-    for gainer_data in raw_gainers:
-        symbol = gainer_data.get('symbol')
-        price = gainer_data.get('price')
-        relative_volume = gainer_data.get('relative_volume')
-
-        if not (symbol and isinstance(price, (int,float)) and PRICE_FILTER_MIN <= price <= PRICE_FILTER_MAX and 
-                isinstance(relative_volume, (int,float)) and relative_volume >= MIN_RELATIVE_VOLUME_FOR_ENTRY):
-            logging.debug(f"Skipping {symbol or 'N/A'}: Fails pre-ATR filters (Price: {price}, RelVol: {relative_volume}).")
-            continue
-
-        bars = fetch_bars_for_atr_adapted(symbol) # Fetch bars for ATR
-        if not bars:
-            logging.warning(f"No bars for ATR for candidate {symbol}. Skipping.")
-            continue
-        
-        current_atr = calculate_atr_from_bars(bars)
-        if current_atr is None or current_atr <= 1e-6: # Check for positive ATR
-            logging.warning(f"Invalid or zero ATR ({current_atr}) for candidate {symbol}. Skipping.")
-            continue
-        
-        logging.info(f"Qualified Candidate: {symbol} (Price: {price:.2f}, RelVol: {relative_volume:.1f}, ATR: {current_atr:.4f})")
-        qualified_candidates.append({
-            'symbol': symbol, 
-            'price': float(price), 
-            'atr': float(current_atr),
-            'reason': f"RelVol {relative_volume:.1f}x" # Reason for scan
-        })
-        # Optimization: if we have enough for MAX_POSITIONS plus a buffer, we can stop early.
-        # For simplicity, we'll just take the top ones after processing all.
-            
-    # Already sorted by relative_volume from simulated fetch, now take top N
-    final_candidates = qualified_candidates[:MAX_POSITIONS] # Take only up to MAX_POSITIONS
-    logging.info(f"Final {len(final_candidates)} candidates after all filters: {[c['symbol'] for c in final_candidates]}")
-    return final_candidates
-
-
-# === Core Strategy Logic (Adapted for New Strategy within Original Framework) ===
-def run_strategy_cycle_new_logic():
-    """
-    Runs one cycle of the new high-volume gapper strategy,
-    fitting into the original script's synchronous, stateful structure.
-    Returns actions for Telegram.
-    """
-    logging.info("--- Starting High-Volume Gapper Strategy Cycle ---")
-    global state # Operates on the global state dictionary
-    current_actions_for_user = [] # Store actions for current cycle for TG notification
-
-    # Market Status Check
-    try:
-        clock = rest_client.get_clock()
-        current_utc_time = now_utc()
-        if not clock.is_open:
-            logging.info(f"Market closed. Next open: {clock.next_open.isoformat() if clock.next_open else 'N/A'}. Skipping trading actions.")
-            return {} # Return empty if market not open for trading
-    except Exception as e:
-        logging.error(f"Market status check failed: {e}", exc_info=True)
-        return {}
-
-    # Fetch current Alpaca positions once
-    try:
-        alpaca_positions_raw: list[Position] = rest_client.get_all_positions()
-        current_alpaca_positions = {p.symbol: p for p in alpaca_positions_raw}
-    except Exception as e:
-        logging.error(f"Failed fetching current Alpaca positions: {e}. Aborting cycle.", exc_info=True)
-        return {}
-
-    # --- 1. Manage Exits ---
-    # The state['trades'] is a list of dicts. We need to iterate and potentially modify/remove items.
-    # It's safer to build a new list of trades to keep.
-    
-    trades_to_keep_in_state = []
-    currently_open_in_state = [t for t in state.get('trades', []) if t.get('status') == 'open']
-    
-    # Get symbols for displacement check (scan once for all open positions)
-    top_candidates_for_displacement_check = scan_and_filter_candidates()
-    top_symbols_for_displacement = {c['symbol'] for c in top_candidates_for_displacement_check}
-
-    for trade_entry in currently_open_in_state:
-        # Make a copy to modify if details change but not exited
-        current_trade_details = trade_entry.copy()
-        symbol = current_trade_details['symbol']
-        entry_price = float(current_trade_details['entry_price'])
-        # Original script used 'executed_at', new strategy uses 'entry_time_utc'
-        entry_time_iso = current_trade_details.get('executed_at', current_trade_details.get('entry_time_utc'))
-        entry_time_utc = isoparse(entry_time_iso) if entry_time_iso else current_utc_time # Fallback
-
-        initial_atr = float(current_trade_details['initial_atr_at_entry'])
-        # Safely get trailing stop details, defaulting if not present (for backward compatibility)
-        high_water_mark = float(current_trade_details.get('high_water_mark', entry_price))
-        current_trailing_stop = float(current_trade_details.get('trailing_stop_price', 
-                                      entry_price - (initial_atr * ATR_INITIAL_SL_MULTIPLIER))) # Default to initial SL if missing
-        is_trailing_active = bool(current_trade_details.get('trailing_stop_active', False))
-        
-        live_price = fetch_current_price_adapted(symbol)
-        if live_price is None:
-            logging.warning(f"No live price for {symbol}, cannot manage exit. Keeping trade.")
-            trades_to_keep_in_state.append(current_trade_details) # Keep if price unavailable
-            continue
-
-        exit_reason = None; trade_details_updated_this_iteration = False
-
-        # Update High Water Mark (for longs)
-        if live_price > high_water_mark:
-            current_trade_details['high_water_mark'] = live_price
-            high_water_mark = live_price # Update local for current logic
-            trade_details_updated_this_iteration = True
-
-        # Activate Trailing Stop
-        profit_in_atr_terms = (live_price - entry_price) / initial_atr if initial_atr > 0 else 0
-        if not is_trailing_active and profit_in_atr_terms >= TRAIL_ACTIVATION_PROFIT_ATR:
-            current_trade_details['trailing_stop_active'] = True
-            is_trailing_active = True # Update local
-            trade_details_updated_this_iteration = True
-            logging.info(f"Trailing stop ACTIVATED for {symbol} at price {live_price:.2f}")
-        
-        # Adjust Trailing Stop Price if active
-        if is_trailing_active:
-            new_trail_target = high_water_mark - (initial_atr * TRAIL_OFFSET_ATR)
-            # Trail only moves up (or stays) for longs
-            if new_trail_target > current_trailing_stop:
-                current_trade_details['trailing_stop_price'] = new_trail_target
-                current_trailing_stop = new_trail_target # Update local
-                trade_details_updated_this_iteration = True
-                logging.info(f"Trailing stop for {symbol} ADJUSTED to: {current_trailing_stop:.2f}")
-        
-        # Check Exits (Priority: Trail, Initial SL, Timeout, Displacement)
-        if is_trailing_active and live_price <= current_trailing_stop:
-            exit_reason = f"Trailing SL Hit ({live_price:.2f} <= {current_trailing_stop:.2f})"
-        if not exit_reason:
-            initial_sl_target = entry_price - (initial_atr * ATR_INITIAL_SL_MULTIPLIER)
-            if live_price <= initial_sl_target:
-                exit_reason = f"Initial SL Hit ({live_price:.2f} <= {initial_sl_target:.2f})"
-        if not exit_reason and (current_utc_time - entry_time_utc).total_seconds() / 60 >= HOLD_TIME_LIMIT_MINUTES:
-            exit_reason = f"Timeout >{HOLD_TIME_LIMIT_MINUTES}min"
-        if not exit_reason and symbol not in top_symbols_for_displacement:
-            exit_reason = "Displaced from Top-3 Candidates"
-
-        if exit_reason:
-            logging.info(f"Exit triggered for {symbol}: {exit_reason}")
-            position_to_close = current_alpaca_positions.get(symbol)
-            qty_to_close = float(position_to_close.qty) if position_to_close and hasattr(position_to_close, 'qty') else 0
-            
-            if qty_to_close > 0: # Assuming long position
-                try:
-<<<<<<< HEAD
-                    # Using original script's execute_trade for selling
-                    exit_order_id = execute_trade_original(symbol=symbol, side=OrderSide.SELL, qty=qty_to_close)
-                    if exit_order_id:
-                        logging.info(f"SELL order to close {symbol} (Qty: {qty_to_close}) submitted. Reason: {exit_reason}. Order ID: {exit_order_id}")
-                        # Record PnL (approximate, actual fill might vary)
-                        pnl_approx = (live_price - entry_price) * qty_to_close
-                        current_actions_for_user.append({
-                            "action": "SELL_MODIFIED", "symbol": symbol, "reason": exit_reason, 
-                            "price": live_price, "pnl": round(pnl_approx, 2)
-                        })
-                        # Mark as closed in the main state.trades list later
-                        current_trade_details['status'] = 'closed'
-                        current_trade_details['exit_reason'] = exit_reason
-                        current_trade_details['exit_price'] = live_price # Approx
-                        current_trade_details['exit_time_utc'] = current_utc_time.isoformat()
-                        current_trade_details['exit_order_id'] = exit_order_id
-                        state['pnl'].append({ # Add to global PNL list as per original structure
-                            'user': current_trade_details.get('user', 'BOT_USER'), # Use original user or default
-                            'symbol': symbol, 'profit': round(pnl_approx, 2), 
-                            'entry_price': entry_price, 'exit_price': live_price, 'time': current_utc_time.isoformat(),
-                            'exit_reason': exit_reason, 'entry_trade_id': current_trade_details.get('trade_id'),
-                            'exit_trade_id': exit_order_id
-                        })
-                        # This trade is now closed, so it won't be added to trades_to_keep_in_state
-                    else:
-                        logging.error(f"Failed to submit close order for {symbol}. Keeping in state.")
-                        trades_to_keep_in_state.append(current_trade_details) # Keep if close failed
-                except Exception as e_close:
-                    logging.error(f"Error executing close order for {symbol}: {e_close}")
-                    trades_to_keep_in_state.append(current_trade_details) # Keep in state
-            elif position_to_close is None and symbol in current_alpaca_positions and float(current_alpaca_positions[symbol].qty) == 0 : # Alpaca says 0 qty
-                 logging.warning(f"Alpaca shows 0 qty for {symbol} which was in state. Marking closed (Orphan/ZeroQty). Reason: {exit_reason}")
-                 current_trade_details['status'] = 'closed_orphan_qty_zero'
-                 current_trade_details['exit_reason'] = exit_reason + " (Alpaca Qty Zero)"
-            elif position_to_close is None: # Not in Alpaca positions
-                 logging.warning(f"{symbol} marked for exit but not found in Alpaca positions. Marking closed (Orphan). Reason: {exit_reason}")
-                 current_trade_details['status'] = 'closed_orphan'
-                 current_trade_details['exit_reason'] = exit_reason + " (Not in Alpaca)"
-
-            # if trade was closed or marked orphan, it's not added to trades_to_keep_in_state
-        else: # No exit reason
-            if trade_details_updated_this_iteration:
-                 logging.debug(f"Details updated for {symbol} (HWM/Trail). Keeping in open trades.")
-            trades_to_keep_in_state.append(current_trade_details) # Keep the trade, possibly with updated details
-
-    # Rebuild state['trades'] with non-open items and the trades_to_keep_in_state
-    non_open_trades = [t for t in state.get('trades', []) if t.get('status') != 'open']
-    state['trades'] = non_open_trades + trades_to_keep_in_state
-=======
-                    a_type = action.get("action")
-                    if a_type == "BUY":
-                        message = f"⬆️ **Entered {symbol}** (Top20)\nApprox Entry: ${action.get('price', 0):.2f}"
-                    elif a_type == "SHORT":
-                        message = f"⬇️ **Shorted {symbol}** (Top20)\nApprox Entry: ${action.get('price', 0):.2f}"
-                    elif a_type == "SELL":
-                        message = (
-                            f"⬇️ **Exited {symbol}** ({action.get('reason', 'N/A')})\n"
-                            f"Approx Exit: ${action.get('price', 0):.2f}\n"
-                            f"Approx PnL: ${action.get('pnl', 0):+.2f} ({action.get('pct', 0):+.2f}%)"
-                        )
-                    elif a_type == "BUY_FAIL":
-                        message = f"⚠️ Failed to buy {symbol}: {action.get('reason', 'Unknown')}"
-                    await bot.send_message(chat_id=user_id, text=message, parse_mode=ParseMode.MARKDOWN)
-                    logging.info(f"Sent notification to {user_id}: {message.splitlines()[0]}")
-                except telegram.error.BadRequest as tg_err:
-                    if "chat not found" in str(tg_err).lower():
-                        logging.error(f"Chat not found {user_id}. Disabling.")
-                        async with state_lock:
-                            state.setdefault("strategy_enabled", {})[user_id] = False
-                            await asyncio.to_thread(save_state, state)
-                    else:
-                        logging.error(f"TG BadRequest {user_id}: {tg_err}")
-                except telegram.error.Forbidden as tg_err:
-                    logging.error(f"TG Forbidden {user_id}. Disabling.")
-                    async with state_lock:
-                        state.setdefault("strategy_enabled", {})[user_id] = False
-                        await asyncio.to_thread(save_state, state)
-                except Exception as tg_err: logging.error(f"TG send error {user_id}: {tg_err}", exc_info=True)
-    else: logging.debug("No actions generated.")
-    logging.debug("JobQueue callback finished.")
->>>>>>> b690d80a4280774987762d719d92e88d5fe6da24
-
-
-    # --- 2. Manage Entries (New Strategy) ---
-    num_currently_open = len([t for t in state['trades'] if t.get('status') == 'open'])
-    
-    if num_currently_open < MAX_POSITIONS:
-        # Use the same candidates from displacement check if fresh enough, or re-scan.
-        # For simplicity, let's use the candidates from the displacement check if available.
-        entry_candidates_list = top_candidates_for_displacement_check # These already have price & ATR
-
-        num_can_open = MAX_POSITIONS - num_currently_open
-        logging.info(f"Space for {num_can_open} new LONG positions.")
-
-        for candidate_info in entry_candidates_list:
-            if num_can_open <= 0: break
-            
-            symbol_candidate = candidate_info['symbol']
-            # Check if already holding (based on state['trades'] list)
-            is_held = any(t['symbol'] == symbol_candidate and t.get('status') == 'open' for t in state['trades'])
-            if is_held:
-                logging.debug(f"Already holding {symbol_candidate} or entry pending. Skipping.")
-                continue
-
-            entry_price_at_scan = candidate_info['price']
-            atr_at_scan = candidate_info['atr']
-            entry_reason_scan = candidate_info['reason']
-
-            logging.info(f"Attempting new LONG entry for {symbol_candidate} (Reason: {entry_reason_scan}, ScanPrice: {entry_price_at_scan:.2f}, ScanATR: {atr_at_scan:.4f})")
-            try:
-                # Use original script's execute_trade for BUY with notional
-                entry_order_id = execute_trade_original(symbol=symbol_candidate, side=OrderSide.BUY, notional=TRADE_NOTIONAL_PER_STOCK)
-                if entry_order_id:
-                    logging.info(f"Submitted BUY for {symbol_candidate}, Notional: ${TRADE_NOTIONAL_PER_STOCK}, Order ID: {entry_order_id}")
-                    
-                    initial_sl_price_calc = entry_price_at_scan - (atr_at_scan * ATR_INITIAL_SL_MULTIPLIER)
-                    
-                    # Create a new trade entry dictionary (original style: list of dicts)
-                    new_trade_entry = {
-                        'user': system_user_id, # Bot-level trade
-                        'symbol': symbol_candidate,
-                        'notional': TRADE_NOTIONAL_PER_STOCK,
-                        'side': 'long', # This strategy is long-only
-                        'executed_at': current_utc_time.isoformat(), # Entry time
-                        'entry_time_utc': current_utc_time.isoformat(), # More explicit name
-                        'entry_price': entry_price_at_scan, # Price at scan time
-                        'trade_id': entry_order_id, # Alpaca order ID as trade_id
-                        'status': 'open',
-                        # New fields for ATR trailing stop
-                        'initial_atr_at_entry': atr_at_scan,
-                        'high_water_mark': entry_price_at_scan, # Init HWM with entry price
-                        'trailing_stop_price': initial_sl_price_calc, # Initial trail is the initial SL
-                        'trailing_stop_active': False,
-                        'entry_reason': entry_reason_scan
-                    }
-                    state['trades'].append(new_trade_entry)
-                    current_actions_for_user.append({
-                        "action": "BUY_NEW_MODIFIED", "symbol": symbol_candidate, 
-                        "price": entry_price_at_scan, "reason": entry_reason_scan
-                    })
-                    num_can_open -= 1
-                else:
-                    logging.error(f"Entry order submission failed for {symbol_candidate} (execute_trade returned None).")
-                    current_actions_for_user.append({"action": "BUY_FAIL_MODIFIED", "symbol": symbol_candidate, "reason": "Order Submit Fail"})
-
-            except Exception as e_entry:
-                logging.error(f"Failed entry execution for {symbol_candidate}: {e_entry}", exc_info=True)
-                current_actions_for_user.append({"action": "BUY_FAIL_MODIFIED", "symbol": symbol_candidate, "reason": str(e_entry)})
-    else:
-        logging.info(f"Max positions ({MAX_POSITIONS}) reached or no new candidates. No new entries considered.")
-
-    # --- 3. Save State ---
-    save_state_original() # Saves global state
-    
-    # For Telegram notifications, if a user is targeted
-    final_actions_map = {}
-    if current_actions_for_user and notification_user_id:
-        final_actions_map[notification_user_id] = current_actions_for_user
-    
-    logging.info("--- Modified Strategy Cycle Finished ---")
-    return final_actions_map
-
-
-# === Async Job Callback (from original script, calls new strategy logic) ===
-async def top_3_strategy_job_callback(context: ContextTypes.DEFAULT_TYPE): # Renamed from original
-    """Async callback for JobQueue, runs the new strategy logic."""
-    logging.info("JobQueue triggered: Running MODIFIED (High-Volume Gapper) strategy cycle in thread.")
-    bot = context.bot
-    actions_map_for_tg = {}
-    
-    try:
-        # run_strategy_cycle_modified is synchronous
-        actions_map_for_tg = await asyncio.to_thread(run_strategy_cycle_new_logic)
-    except Exception as e:
-        logging.error(f"Exception in threaded modified strategy cycle: {e}", exc_info=True)
-        # Notify admin (first enabled user, or hardcoded if available)
-        admin_id_tg = next(iter(state.get("strategy_enabled", {})), None) # Get first key
-        if admin_id_tg and state.get("strategy_enabled", {}).get(admin_id_tg):
-            try:
-                await bot.send_message(chat_id=admin_id_tg, text=f"⚠️ CRITICAL ERROR in MODIFIED strategy job: {type(e).__name__}. Check logs.")
-            except Exception as notify_err_tg:
-                logging.error(f"Failed to send critical error TG notification: {notify_err_tg}")
-
-    if actions_map_for_tg:
-        num_total_actions = sum(len(acts) for acts in actions_map_for_tg.values())
-        logging.info(f"Processing {num_total_actions} actions for TG notification from modified strategy...")
-        for user_id_tg, actions_list_tg in actions_map_for_tg.items():
-            for action_tg in actions_list_tg:
-                message_tg = "❓ Unknown action"
-                symbol_tg = action_tg.get("symbol", "N/A")
-                reason_tg = action_tg.get("reason", "N/A")
-                price_tg = action_tg.get("price", 0)
-                pnl_tg = action_tg.get("pnl") # Can be None
-
-                try:
-                    a_type_tg = action_tg.get("action")
-                    if a_type_tg == "BUY_NEW_MODIFIED": # New action type
-                        message_tg = f"⬆️ **Entered LONG {symbol_tg}** (VolGapper)\nReason: {reason_tg}\nApprox Entry: ${price_tg:.2f}"
-                    elif a_type_tg == "SELL_CLOSE_MODIFIED": # New action type
-                        pnl_str_tg = f"${pnl_tg:+.2f}" if pnl_tg is not None else "N/A"
-                        message_tg = (
-                            f"⬇️ **Exited {symbol_tg}** (Reason: {reason_tg})\n"
-                            f"Approx Exit: ${price_tg:.2f}\n"
-                            f"Approx PnL: {pnl_str_tg}"
-                        )
-                    elif a_type_tg == "BUY_FAIL_MODIFIED": # New action type
-                         message_tg = f"⚠️ Failed to enter {symbol_tg}: {reason_tg}"
-                    else: # Fallback for original action types if any slip through
-                        message_tg = f"Original Action: {a_type_tg} for {symbol_tg}"
-                    
-                    await bot.send_message(chat_id=user_id_tg, text=message_tg, parse_mode=ParseMode.MARKDOWN)
-                    logging.info(f"Sent TG notification to {user_id_tg}: {message_tg.splitlines()[0]}")
-                except Exception as tg_err_send:
-                    logging.error(f"Error sending TG notification to {user_id_tg}: {tg_err_send}", exc_info=True)
-                    if isinstance(tg_err_send, (telegram.error.BadRequest, telegram.error.Forbidden)):
-                        if "chat not found" in str(tg_err_send).lower() or "bot was blocked" in str(tg_err_send).lower():
-                            logging.error(f"Chat not found or bot blocked for {user_id_tg}. Disabling in state.")
-                            async with state_lock:
-                                if user_id_tg in state.get("strategy_enabled", {}):
-                                    state["strategy_enabled"][user_id_tg] = False
-                                    await asyncio.to_thread(save_state_original)
-    else:
-        logging.debug("No actions generated by modified strategy for TG notification.")
-    logging.debug("JobQueue callback for modified strategy finished.")
-
-
-# === Telegram Handlers (from original script) ===
-async def handle_start_top3(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user; user_id = str(user.id); logging.info(f"/start_top3 from User {user_id}")
-    async with state_lock: 
-        state.setdefault("strategy_enabled", {})[user_id] = True
-        state.setdefault("goals", {}).setdefault(user_id, {"goal": "Trade High-Volume Gappers", "log": []}) # Updated goal
-    await asyncio.to_thread(save_state_original); 
-    await update.message.reply_text("✅ High-Volume Gapper Strategy Enabled for your notifications."); 
-    logging.info(f"Strategy enabled for user: {user_id}")
-
-async def handle_stop_top3(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user; user_id = str(user.id); logging.info(f"/stop_top3 from User {user_id}")
-    async with state_lock: state.setdefault("strategy_enabled", {})[user_id] = False
-    await asyncio.to_thread(save_state_original); 
-    await update.message.reply_text("⏹️ High-Volume Gapper Strategy Disabled for your notifications."); 
-    logging.info(f"Strategy disabled for user: {user_id}")
-
-async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE): # Adapted for new strategy state
-    user = update.effective_user; user_id_str = str(user.id)
-    logging.info(f"/status from User {user_id_str} (High-Volume Gapper Bot)")
-    async with state_lock:
-        is_enabled_for_user = state.get("strategy_enabled", {}).get(user_id_str, False)
-        open_bot_trades = [t for t in state.get("trades", []) if t.get('status') == 'open'] # Bot's trades
-    
-    status_msg_user = "✅ ENABLED (for your notifications)" if is_enabled_for_user else "⏹️ DISABLED (for your notifications)"
-    reply_msg = f"📊 **Bot Status (High-Volume Gapper): {status_msg_user}**\n\n"
-    total_unrealized_bot_pnl = 0.0
-
-<<<<<<< HEAD
-    if not open_bot_trades:
-        reply_msg += "ℹ️ No open positions currently managed by the bot."
-    else:
-        symbols_to_fetch_price = list({t['symbol'] for t in open_bot_trades})
-        current_prices_map = {}
-        if symbols_to_fetch_price:
-            # This is sync, called from async handler. Original script did this.
-            current_prices_map = {s: fetch_current_price_adapted(s) for s in symbols_to_fetch_price}
-=======
-async def handle_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user; user_id = str(user.id); logging.info(f"/pnl from User {user_id}")
-    async with state_lock: state.setdefault("pnl", []); pnl_recs = [p for p in state["pnl"] if p.get("user") == user_id]
-    if not pnl_recs: await update.message.reply_text("📉 No closed trades yet."); return
-    profit = sum(t.get("profit", 0) for t in pnl_recs); wins = sum(1 for t in pnl_recs if t.get("profit", 0) > 0); losses = sum(1 for t in pnl_recs if t.get("profit", 0) < 0); trades = len(pnl_recs); win_rate = (wins / trades * 100) if trades > 0 else 0
-    limit = 10; summary = f"📈 **Closed PnL (Last {min(limit, trades)}/{trades})**\n\n"
-    for t in reversed(pnl_recs[-limit:]):
-        sym = t.get('symbol', '?'); p = t.get('profit', 0); pct = t.get('pct_change', 0); r = t.get('exit_reason', 'N/A'); ts = "N/A"
-        if t.get("time"):
-            try:
-                ts = isoparse(t["time"]).strftime('%m-%d %H:%M')
-            except Exception:
-                pass
-        summary += f" - **{sym}**: ${p:+.2f} ({pct:+.2f}%) at {ts} _({r})_\n"
-    summary += f"\n💰 **Total Realized: ${profit:.2f}** | Win Rate: {win_rate:.1f}% ({wins}W/{losses}L)"
-    await update.message.reply_text(summary, parse_mode=ParseMode.MARKDOWN)
->>>>>>> b690d80a4280774987762d719d92e88d5fe6da24
-
-        reply_msg += f"📈 **Bot's Open Positions ({len(open_bot_trades)}):**\n"
-        for trade_item in open_bot_trades:
-            sym_item = trade_item.get("symbol", "N/A")
-            entry_item = float(trade_item.get("entry_price", 0))
-            notional_item = float(trade_item.get("notional", trade_item.get("notional_value", 0)))
-            current_price_item = current_prices_map.get(sym_item)
-            exec_at_item = trade_item.get("executed_at", trade_item.get("entry_time_utc"))
-            trail_sp_item = trade_item.get("trailing_stop_price")
-            trail_active_item = trade_item.get("trailing_stop_active", False)
-
-            pnl_str_item, pct_str_item, dur_str_item = "N/A", "", "N/A"
-            if current_price_item is None: pnl_str_item = "(Price N/A)"
-            elif entry_item > 0 and notional_item > 0:
-                try:
-                    shares_item = notional_item / entry_item
-                    pnl_item = (current_price_item - entry_item) * shares_item
-                    pct_item = ((current_price_item - entry_item) / entry_item) * 100 if entry_item != 0 else 0
-                    total_unrealized_bot_pnl += pnl_item
-                    pnl_str_item = f"${pnl_item:+.2f}"; pct_str_item = f"({pct_item:+.2f}%)"
-                except Exception: pnl_str_item = "(Calc Err)"
-            
-            if exec_at_item:
-                try:
-                    duration_item = now_utc() - isoparse(exec_at_item)
-                    secs_item = int(duration_item.total_seconds())
-                    d_i,r_i = divmod(secs_item,86400); h_i,r_i=divmod(r_i,3600); m_i,_=divmod(r_i,60)
-                    dur_parts_item = [f"{x}{u}" for x,u in zip([d_i,h_i,m_i],['d','h','m']) if x > 0]
-                    dur_str_item = " ".join(dur_parts_item) if dur_parts_item else "~0m"
-                except Exception: dur_str_item = "(Time Err)"
-            
-            trail_info_item = f"TS: ${trail_sp_item:.2f}{' (A)' if trail_active_item else ''}" if trail_sp_item is not None else "TS: N/A"
-            reply_msg += f" - **{sym_item}** | PnL: {pnl_str_item} {pct_str_item}\n   Entry: ${entry_item:.2f} | {trail_info_item} | Held: {dur_str_item}\n"
-        
-        reply_msg += f"\n💰 **Total Bot Unrealized: ${total_unrealized_bot_pnl:+.2f}**"
-    
-    await update.message.reply_text(reply_msg, parse_mode=ParseMode.MARKDOWN)
-
-
-async def handle_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE): # Adapted
-    user = update.effective_user; user_id_str = str(user.id)
-    logging.info(f"/pnl from User {user_id_str} (High-Volume Gapper Bot)")
-    async with state_lock:
-        all_pnl_records = state.get("pnl", [])
-        # Assuming PNL records from the new strategy are marked with a specific user or have a common trait
-        # For simplicity, show all PNL records for now, or filter by 'BOT_USER' if that's how they are stored
-        bot_pnl_records = [p for p in all_pnl_records if p.get('user') == "BOT_STRATEGY_USER" or not p.get('user')] # Or more specific filter
-
-    if not bot_pnl_records:
-        await update.message.reply_text("📉 No closed trades recorded by the bot strategy yet."); return
-
-    total_profit_val = sum(t.get("profit", 0) for t in bot_pnl_records)
-    wins_count = sum(1 for t in bot_pnl_records if t.get("profit", 0) > 0)
-    losses_count = sum(1 for t in bot_pnl_records if t.get("profit", 0) < 0)
-    total_trades_count = len(bot_pnl_records)
-    win_rate_val = (wins_count / total_trades_count * 100) if total_trades_count > 0 else 0
-    
-    display_limit = 10
-    summary_msg = f"📈 **Bot Realized PnL (Last {min(display_limit, total_trades_count)} of {total_trades_count} Total Strategy Trades)**\n\n"
-    for pnl_entry_item in reversed(bot_pnl_records[-display_limit:]):
-        sym_pnl = pnl_entry_item.get('symbol', '?'); profit_pnl = pnl_entry_item.get('profit', 0)
-        entry_p_pnl = pnl_entry_item.get('entry_price', 0); exit_p_pnl = pnl_entry_item.get('exit_price', 0)
-        pct_pnl = ((exit_p_pnl - entry_p_pnl) / entry_p_pnl * 100) if entry_p_pnl else 0
-        reason_pnl = pnl_entry_item.get('exit_reason', 'N/A'); time_str_pnl = "N/A"
-        if pnl_entry_item.get("time"):
-            try:
-                time_str_pnl = isoparse(pnl_entry_item["time"]).strftime('%m-%d %H:%M')
-            except Exception: # It's good practice to catch specific exceptions, but Exception catches most.
-                pass # If isoparse or strftime fails, time_str_pnl will retain its default "N/A"
-        summary_msg += f" - **{sym_pnl}**: ${profit_pnl:+.2f} ({pct_pnl:+.2f}%) at {time_str_pnl} _({reason_pnl})_\n"
-    summary_msg += f"\n💰 **Total Bot Strategy Realized: ${total_profit_val:.2f}** | Win Rate: {win_rate_val:.1f}% ({wins_count}W/{losses_count}L)"
-    await update.message.reply_text(summary_msg, parse_mode=ParseMode.MARKDOWN)
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE): # From original
-    user = update.effective_user; msg = update.message; user_id = str(user.id); username = user.username or "N/A"
-    if not user or not msg: return
-    logging.info(f"📨 Msg from User {user_id} ({username}): '{msg.text}'")
-    async with state_lock: known_user_check = user_id in state.get("strategy_enabled", {})
-    
-    # Simplified: Bot is either enabled for notifications or not by user. Core strategy runs independently.
-    reply_text_options = "ℹ️ Bot active (High-Volume Gapper Strategy).\nCommands:\n`/start_top3` (Enable Notifications)\n`/stop_top3` (Disable Notifications)\n`/status` (Bot's Open Trades)\n`/pnl` (Bot's Realized PnL)"
-    if known_user_check :
-        await update.message.reply_text(reply_text_options, parse_mode=ParseMode.MARKDOWN)
-    else: # New user interaction
-        logging.info(f"New user {user_id} ({username}) interacted via message.")
-        async with state_lock:
-            state.setdefault("strategy_enabled", {})[user_id] = False # Default new users to notifications disabled
-            state.setdefault("goals", {}).setdefault(user_id, {"goal": "Observe VolGapper Bot", "log": []})
-        await asyncio.to_thread(save_state_original)
-        await update.message.reply_text(f"👋 Welcome, {user.first_name}!\nThis bot trades high-volume gappers.\nUse `/start_top3` to enable notifications about its trades.", parse_mode=ParseMode.MARKDOWN)
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None: # From original
-    logging.error("Exception during Telegram update handling:", exc_info=context.error)
-    if isinstance(context.error, telegram.error.Conflict):
-        logging.critical("TELEGRAM CONFLICT ERROR: Another instance of this bot may be running!")
-        if isinstance(update, Update) and update.effective_chat:
-             try: await context.bot.send_message(chat_id=update.effective_chat.id, text="🚨 BOT CONFLICT DETECTED! Please ensure only one instance is running.")
-             except Exception as e_conf: logging.error(f"Failed to send TG conflict warning: {e_conf}")
-
-# === Main Application Setup (from original script) ===
-def run_bot_main_combined():
-    if not TELEGRAM_BOT_TOKEN:
-        logging.warning("TELEGRAM_BOT_TOKEN not set. Telegram features will be disabled. Strategy will attempt to run headless.")
-        # Fallback to a non-Telegram loop if desired, or exit
-        # For now, let's try to run the strategy loop directly if no TG token
-        logging.info("Attempting to run strategy headless due to missing Telegram token.")
-        try:
-            while True:
-                run_strategy_cycle_new_logic() # This is synchronous
-                time.sleep(JOB_INTERVAL_MINUTES * 60)
-        except KeyboardInterrupt: logging.info("Headless bot stopped manually.")
-        except Exception as e_headless: logging.critical(f"Critical error in headless loop: {e_headless}", exc_info=True)
-        finally: 
-            logging.info("Headless bot attempting final state save.")
-            save_state_original()
+APCA_API_KEY_ID = os.getenv("ALPACA_SCALPINGSNIPER_KEY")
+APCA_API_SECRET_KEY = os.getenv("ALPACA_SCALPINGSNIPER_SECRET_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("Slcaper_Stock_TELEGRAM_BOT_TOKEN")
+ALPACA_IS_PAPER = os.getenv("ALPACA_PAPER_TRADING", "true").lower() == "true"
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_USER_ID")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-nano")
+
+log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - [%(funcName)s] - %(message)s')
+log_file = 'Short_King.log'
+file_handler = RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=5, encoding='utf-8')
+file_handler.setFormatter(log_formatter)
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_formatter)
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+if logger.hasHandlers(): logger.handlers.clear()
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# --- Global State, Clients, and Caches ---
+trading_client = TradingClient(APCA_API_KEY_ID, APCA_API_SECRET_KEY, paper=ALPACA_IS_PAPER)
+trading_stream = TradingStream(APCA_API_KEY_ID, APCA_API_SECRET_KEY, paper=ALPACA_IS_PAPER)
+polygon_rest_client = RESTClient(POLYGON_API_KEY)
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+POTENTIAL_GAPPERS: Dict[str, Any] = {}
+PENDING_ORDERS: Dict[str, Dict[str, Any]] = {}
+OPEN_POSITIONS: Dict[str, Dict[str, Any]] = {}
+TRADED_SYMBOLS_TODAY: set[str] = set()
+ANALYZED_SYMBOLS_TODAY: set[str] = set()
+REALIZED_PNL_TODAY: float = 0.0
+TRADE_SIGNAL_QUEUE = asyncio.Queue()
+API_SEMAPHORE = asyncio.Semaphore(SETTINGS.CONCURRENT_TASKS)
+trading_enabled: bool = True
+pyramiding_enabled: bool = True
+
+SECONDARY_WATCHLIST: Dict[str, Dict[str, any]] = {}
+second_wave_triggered_today: bool = False
+
+# ==============================================================================
+# --- UTILITY & API WRAPPER FUNCTIONS ---
+# ==============================================================================
+ET = ZoneInfo("America/New_York")
+_POLY_MARKET = "stocks"
+
+def check_environment_variables():
+    """Checks for all required environment variables at startup."""
+    required_vars = {
+        "Alpaca Key ID": APCA_API_KEY_ID,
+        "Alpaca Secret Key": APCA_API_SECRET_KEY,
+        "Polygon API Key": POLYGON_API_KEY,
+        "Telegram Bot Token": TELEGRAM_BOT_TOKEN,
+        "Telegram Chat ID": TELEGRAM_CHAT_ID,
+        "OpenAI API Key": OPENAI_API_KEY,
+    }
+    missing_vars = [name for name, value in required_vars.items() if not value]
+    if missing_vars:
+        logging.critical(f"FATAL: Missing required environment variables: {', '.join(missing_vars)}")
+        sys.exit(1)
+
+    if not openai_client: logging.warning("OpenAI client not configured. AI analysis will be disabled.")
+
+    logging.info("All required environment variables are present.")
+
+def get_current_et_time() -> dtime:
+    if SETTINGS.SIMULATION_MODE:
+        return dtime(hour=SETTINGS.SIMULATED_ET_HOUR)
+    return datetime.now(ET).time()
+
+def is_trading_day() -> bool:
+    """Returns True if the current day is a weekday (Monday-Friday)."""
+    return datetime.now(ET).weekday() < 5
+
+def is_premarket() -> bool:
+    now_et = get_current_et_time()
+    return dtime(4, 0) <= now_et < dtime(9, 30)
+
+def is_rth() -> bool:
+    now_et = get_current_et_time()
+    return dtime(9, 30) <= now_et < dtime(16, 0)
+
+def calc_position_size(price: float) -> int:
+    if price <= 0: return 0
+    return int(SETTINGS.TRADE_NOTIONAL_VALUE / price)
+
+def send_telegram_alert(message: str):
+    """Sends a Telegram alert and logs the attempt."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.warning("Telegram Token or Chat ID not set. Cannot send alert.")
         return
 
-    try:
-        app_tg = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-        app_tg.add_handler(CommandHandler("start_top3", handle_start_top3))
-        app_tg.add_handler(CommandHandler("stop_top3", handle_stop_top3))
-        app_tg.add_handler(CommandHandler("status", handle_status))
-        app_tg.add_handler(CommandHandler("pnl", handle_pnl))
-        app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        app_tg.add_error_handler(error_handler)
+    logging.info(f"Attempting to send Telegram alert: '{message[:50]}...'")
 
-        jq_tg = app_tg.job_queue
-        if jq_tg:
-            # Use the new strategy callback
-            jq_tg.run_repeating(top_3_strategy_job_callback, 
-                                interval=timedelta(minutes=JOB_INTERVAL_MINUTES), 
-                                first=timedelta(seconds=20), # Give a bit of time for init
-                                name="high_volume_gapper_strategy_job_MOD") # New job name
-            logging.info(f"Scheduled MODIFIED strategy job every {JOB_INTERVAL_MINUTES} minutes via Telegram JobQueue.")
-        else:
-            logging.error("Telegram JobQueue not available. Periodic strategy execution will not occur via JobQueue.")
-            # Fallback or exit if JobQueue is essential
-            return
-        
-        logging.info("Starting Telegram polling for High-Volume Gapper Bot...")
-        app_tg.run_polling(drop_pending_updates=True)
-    except Exception as e_tg_main:
-        logging.critical(f"Failed running Telegram bot application: {e_tg_main}", exc_info=True)
-
-# === Entry Point (from original script) ===
-if __name__ == "__main__":
-    logging.info(f"Initial state loaded. Trades: {len(state.get('trades',[]))}, PnL: {len(state.get('pnl',[]))}, Users Configured: {len(state.get('strategy_enabled',{}))}")
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
-        run_bot_main_combined()
-    except KeyboardInterrupt:
-        logging.info("Bot stopped manually (KeyboardInterrupt in __main__).")
-    except Exception as e_main_exc:
-        logging.critical(f"Unhandled exception in __main__ execution block: {e_main_exc}", exc_info=True)
+        response = requests.post(url, json=payload, timeout=10)
+        response.raise_for_status()
+        logging.info("Telegram alert sent successfully.")
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Telegram API request failed: {e}")
+    except Exception as e:
+        logging.error(f"An unexpected error occurred while sending Telegram alert: {e}")
+
+def _mk_snapshot_from_gapper(gapper):
+    """Convert any Polygon row or cached object into a standard SimpleNamespace."""
+    if isinstance(gapper, SimpleNamespace) and hasattr(gapper, "pct"):
+        return gapper
+    if isinstance(gapper, dict):
+        day = gapper.get("day", {})
+        return SimpleNamespace(
+            ticker=gapper.get("ticker") or gapper.get("T"),
+            pct=gapper.get("todays_change_percent") or gapper.get("todaysChangePerc") or gapper.get("P"),
+            volume=gapper.get("volume") or day.get("v"),
+            last=gapper.get("last") or day.get("c"),
+        )
+    return SimpleNamespace(
+        ticker=getattr(gapper, "ticker", None),
+        pct=getattr(gapper, "todays_change_percent", None) or getattr(gapper, "pct", None),
+        volume=getattr(gapper, "volume", None) or getattr(getattr(gapper, "day", None) or (), "v", None),
+        last=getattr(gapper, "last", None) or getattr(getattr(gapper, "day", None) or (), "c", None),
+    )
+
+async def get_last_quote_for_symbol(symbol: str):
+    """Asynchronous wrapper for fetching a quote."""
+    client = RESTClient(POLYGON_API_KEY)
+    try:
+        func = partial(client.get_last_quote, ticker=symbol)
+        return await asyncio.to_thread(func)
     finally:
-<<<<<<< HEAD
-        logging.info("Attempting final state save from __main__ finally block...")
-        save_state_original(state) # Ensure global state is saved
-        logging.info("-------------------- BOT END (High-Volume Gapper Strategy - MODIFIED) ----------------------")
-=======
-        logging.info("Attempting final state save...")
-        save_state(state)
-        logging.info("-------------------- BOT END ----------------------")
->>>>>>> b690d80a4280774987762d719d92e88d5fe6da24
+        if hasattr(client, "close"):
+            client.close()
+
+async def get_snapshot_for_symbol(symbol: str):
+    """Asynchronous wrapper for fetching a full snapshot."""
+    client = RESTClient(POLYGON_API_KEY)
+    try:
+        func = partial(client.get_snapshot_ticker, ticker=symbol, market_type=_POLY_MARKET)
+        return await asyncio.to_thread(func)
+    finally:
+        if hasattr(client, "close"):
+            client.close()
+
+async def liquidate_position(symbol: str, reason: str):
+    """Closes a specific position with a market order."""
+    logging.warning(f"LIQUIDATING {symbol} due to: {reason}")
+    try:
+        if symbol in OPEN_POSITIONS:
+            stop_id = OPEN_POSITIONS[symbol].get("stop_id")
+            if stop_id:
+                try:
+                    await asyncio.to_thread(trading_client.cancel_order_by_id, order_id=stop_id)
+                except APIError as e:
+                    logging.error(f"Could not cancel stop order for {symbol}: {e}")
+
+            close_request = ClosePositionRequest(symbol_or_asset_id=symbol)
+            await asyncio.to_thread(trading_client.close_position, close_request)
+            send_telegram_alert(f"🚨 *LIQUIDATED:* Position ${symbol} closed. Reason: {reason}.")
+            OPEN_POSITIONS.pop(symbol, None)
+    except APIError as e:
+        logging.error(f"Failed to liquidate {symbol}: {e}")
+
+async def liquidate_all_positions():
+    """Closes all open positions as a safety measure."""
+    logging.warning("Initiating liquidation of all open positions.")
+    try:
+        await asyncio.to_thread(trading_client.close_all_positions, cancel_orders=True)
+        send_telegram_alert("🚨 *LIQUIDATION:* All positions have been covered.")
+        OPEN_POSITIONS.clear()
+    except Exception as e:
+        logging.error(f"Failed during liquidation: {e}")
+
+# ==============================================================================
+# --- ADVANCED INSIGHTS & AI ANALYSIS FUNCTIONS ---
+# ==============================================================================
+async def get_52_week_high_low(symbol: str) -> (Optional[float], Optional[float]):
+    """Fetches the 52-week high and low for a symbol from Polygon."""
+    try:
+        end_date = datetime.now().date()
+        start_date = end_date - timedelta(days=365)
+
+        aggs = await asyncio.to_thread(
+            polygon_rest_client.get_aggs,
+            symbol, 1, 'day', start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')
+        )
+        if not aggs: return "N/A", "N/A"
+
+        high_52_week = max(agg.high for agg in aggs)
+        low_52_week = min(agg.low for agg in aggs)
+        return high_52_week, low_52_week
+    except Exception as e:
+        logging.error(f"Could not fetch 52-week data for {symbol}: {e}")
+        return "N/A", "N/A"
+
+async def get_rsi(symbol: str, period: int = 14, timeframe: str = 'minute', limit: int = 100) -> Optional[float]:
+    """Fetches price data and calculates the RSI."""
+    try:
+        end_date = datetime.now(ET).date()
+        start_date = end_date - timedelta(days=5)
+
+        aggs = await asyncio.to_thread(
+            polygon_rest_client.get_aggs,
+            symbol, 1, timeframe, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), limit=limit
+        )
+        if len(aggs) < period + 1: return None
+
+        closes = np.array([agg.close for agg in aggs])
+        deltas = np.diff(closes)
+        seed = deltas[:period]
+
+        up = seed[seed >= 0].sum()/period
+        down = -seed[seed < 0].sum()/period
+
+        if down == 0: return 100.0
+        rs = up / down
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+
+        return rsi
+    except Exception as e:
+        logging.error(f"Could not calculate RSI for {symbol}: {e}")
+        return None
+
+async def get_vwap(symbol: str) -> Optional[float]:
+    """Fetches the current day's VWAP from a Polygon snapshot."""
+    try:
+        snapshot = await get_snapshot_for_symbol(symbol)
+        if snapshot and hasattr(snapshot, 'day') and hasattr(snapshot.day, 'vwap') and snapshot.day.vwap:
+            return snapshot.day.vwap
+        return None
+    except Exception as e:
+        logging.error(f"Could not fetch VWAP for {symbol}: {e}")
+        return None
+
+async def get_market_context() -> str:
+    """Fetches data for SPY and QQQ to determine overall market sentiment."""
+    try:
+        spy_snapshot, qqq_snapshot = await asyncio.gather(
+            get_snapshot_for_symbol("SPY"),
+            get_snapshot_for_symbol("QQQ")
+        )
+        spy_change = spy_snapshot.ticker.todays_change_perc
+        qqq_change = qqq_snapshot.ticker.todays_change_perc
+
+        avg_change = (spy_change + qqq_change) / 2
+        if avg_change > 0.75: return f"Strongly Bullish (SPY {spy_change:.2f}%, QQQ {qqq_change:.2f}%)"
+        if avg_change > 0.2: return f"Bullish (SPY {spy_change:.2f}%, QQQ {qqq_change:.2f}%)"
+        if avg_change < -0.75: return f"Strongly Bearish (SPY {spy_change:.2f}%, QQQ {qqq_change:.2f}%)"
+        if avg_change < -0.2: return f"Bearish (SPY {spy_change:.2f}%, QQQ {qqq_change:.2f}%)"
+        return f"Mixed/Flat (SPY {spy_change:.2f}%, QQQ {qqq_change:.2f}%)"
+    except Exception as e:
+        logging.error(f"Could not fetch market context: {e}")
+        return "Unknown"
+
+async def generate_openai_analysis(symbol: str, initial_gap_percent: Optional[float]):
+    """Gathers data, prompts OpenAI to perform research, and sends the analysis."""
+    if not openai_client: return
+
+    logging.info(f"Generating full quantitative AI analysis for {symbol}...")
+    try:
+        results = await asyncio.gather(
+            get_52_week_high_low(symbol),
+            get_rsi(symbol),
+            get_vwap(symbol),
+            get_market_context(),
+            get_snapshot_for_symbol(symbol),
+            return_exceptions=True
+        )
+
+        high_52, low_52 = results[0] if not isinstance(results[0], Exception) else ("N/A", "N/A")
+        rsi = results[1] if not isinstance(results[1], Exception) else None
+        vwap = results[2] if not isinstance(results[2], Exception) else None
+        market_context = results[3] if not isinstance(results[3], Exception) else "Unknown"
+        current_snapshot = results[4] if not isinstance(results[4], Exception) else None
+
+        current_price = "N/A"
+        if current_snapshot and hasattr(current_snapshot, 'ticker') and hasattr(current_snapshot.ticker, 'last_trade') and current_snapshot.ticker.last_trade:
+            current_price = current_snapshot.ticker.last_trade.price
+
+        rsi_text = f"{rsi:.1f} ('Overbought')" if isinstance(rsi, float) and rsi > 70 else (f"{rsi:.1f}" if isinstance(rsi, float) else "N/A")
+        vwap_text = f"${vwap:.2f}" if isinstance(vwap, float) else "N/A"
+        price_vs_vwap = "N/A"
+        if isinstance(current_price, float) and isinstance(vwap, float):
+            price_vs_vwap = 'above' if current_price > vwap else 'below'
+
+        prompt = (
+            f"**[Data Provided by Bot]**\n"
+            f"- Ticker: ${symbol}\n"
+            f"- Current Price: ${current_price}\n"
+            f"- Pre-Market Gap: +{initial_gap_percent:.1f}%\n"
+            f"- 52-Week Range: ${low_52} - ${high_52}\n"
+            f"- RSI (1-minute): {rsi_text}\n"
+            f"- Price vs. VWAP: Trading {price_vs_vwap} VWAP ({vwap_text})\n"
+            f"- Broader Market Context: {market_context}\n\n"
+            f"**[Your Task as a Quantitative Analyst]**\n"
+            f"1.  **Web Research:** Search the web for:\n"
+            f"    a) The latest significant news/catalysts for ${symbol} today.\n"
+            f"    b) Recent social sentiment from Reddit and Twitter/X.\n"
+            f"    c) The most recently reported Short Interest % of float.\n"
+            f"2.  **Synthesize Analysis:** Based on BOTH the provided data and your web research, provide the following:\n"
+            f"    a) **Bull Case:** What are the primary arguments for the stock going even higher?\n"
+            f"    b) **Bear Case (Short Thesis):** What are the primary arguments for shorting this stock?\n"
+            f"    c) **Actionable Signal:** What specific technical event (e.g., a break below VWAP) would confirm a high-probability short entry?\n"
+            f"    d) **Risk Analysis & Profit Target:** What is the main risk to this short trade (e.g., short squeeze)? Suggest a theoretical profit target based on a historical support level or other indicator.\n\n"
+            f"Format the response clearly and concisely."
+        )
+
+        completion = await asyncio.to_thread(
+            openai_client.chat.completions.create, model=OPENAI_MODEL, messages=[{"role": "user", "content": prompt}]
+        )
+        analysis_text = completion.choices[0].message.content
+
+        full_message = f"🤖 *Quantitative AI Analysis for ${symbol}*\n\n{analysis_text}"
+        send_telegram_alert(full_message)
+
+    except Exception as e:
+        logging.error(f"Failed to generate OpenAI analysis for {symbol}: {e}", exc_info=True)
+        send_telegram_alert(f"🤖 Failed to generate full AI analysis for ${symbol}.")
+
+# ==============================================================================
+# --- TELEGRAM BOT COMMANDS ---
+# ==============================================================================
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = f"*Short_King.py v4.0* is running."
+    await update.message.reply_text(text, parse_mode='Markdown')
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    unrealized_pl = sum(float(p['position_obj'].unrealized_pl) for p in OPEN_POSITIONS.values() if 'position_obj' in p)
+    text = (f"*Open Positions:* {len(OPEN_POSITIONS)} / {SETTINGS.MAX_POSITIONS}\n"
+            f"*Watchlist Size:* {len(POTENTIAL_GAPPERS) // 2}\n"
+            f"*2nd Wave Watchlist:* {len(SECONDARY_WATCHLIST)}\n"
+            f"*Trading Enabled:* {'✅' if trading_enabled else '⏸️'}\n"
+            f"*Pyramiding Enabled:* {'✅' if pyramiding_enabled else '❌'}\n"
+            f"*Unrealized P/L:* `${unrealized_pl:+.2f}`\n"
+            f"*Realized P/L Today:* `${REALIZED_PNL_TODAY:+.2f}`")
+    await update.message.reply_text(text, parse_mode='Markdown')
+
+async def positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not OPEN_POSITIONS:
+        await update.message.reply_text("No open short positions.")
+        return
+    message = "*--- Open Short Positions ---*\n"
+    for symbol, data in OPEN_POSITIONS.items():
+        pnl = float(data['position_obj'].unrealized_pl)
+        initial_gap_str = f"{data.get('initial_gap_percent', 'N/A'):.1f}%" if data.get('initial_gap_percent') else "N/A"
+        message += (f"`${symbol}` | State: *{data['state'].upper()}*\n"
+                    f"   Qty: {data['position_obj'].qty} @ ${float(data['position_obj'].avg_entry_price):.2f}\n"
+                    f"   Initial Gap: {initial_gap_str} | P/L: `${pnl:+.2f}`\n")
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    unrealized_pl = sum(float(p['position_obj'].unrealized_pl) for p in OPEN_POSITIONS.values() if 'position_obj' in p)
+    message = (f"*--- P&L Summary ---*\n"
+               f"💰 *Realized P/L (Today):* `${REALIZED_PNL_TODAY:+.2f}`\n"
+               f"📈 *Unrealized P/L (Open):* `${unrealized_pl:+.2f}`")
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+async def refresh_insights_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not OPEN_POSITIONS:
+        await update.message.reply_text("No open positions to refresh.")
+        return
+
+    await update.message.reply_text(f"🔥 Refreshing insights for {len(OPEN_POSITIONS)} open position(s)...")
+    for symbol, data in OPEN_POSITIONS.items():
+        initial_gap = data.get('initial_gap_percent')
+        if not initial_gap:
+            try:
+                snapshot = await get_snapshot_for_symbol(symbol)
+                if snapshot and not isinstance(snapshot, str) and hasattr(snapshot, 'ticker'):
+                    initial_gap = snapshot.ticker.todays_change_perc
+                else:
+                    logging.warning(f"Invalid snapshot data received for {symbol} during refresh.")
+                    initial_gap = 0.0
+            except Exception as e:
+                logging.error(f"Could not fetch snapshot for {symbol} during refresh: {e}")
+                initial_gap = 0.0
+        asyncio.create_task(generate_openai_analysis(symbol, initial_gap))
+
+async def liquidate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        symbol = context.args[0].upper()
+        if symbol in OPEN_POSITIONS:
+            await update.message.reply_text(f"🚨 Liquidating position in ${symbol} now...")
+            await liquidate_position(symbol, "Manual liquidation via Telegram command.")
+        else:
+            await update.message.reply_text(f"No open position found for ${symbol}.")
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: /liquidate [SYMBOL]")
+
+async def close_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not OPEN_POSITIONS:
+        await update.message.reply_text("No open positions to close.")
+        return
+    await update.message.reply_text(f"🚨🚨 Liquidating ALL {len(OPEN_POSITIONS)} open position(s) now...")
+    await liquidate_all_positions()
+
+async def pause_trading_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global trading_enabled
+    trading_enabled = False
+    await update.message.reply_text("⏸️ Trading has been PAUSED. The bot will not open new positions.")
+
+async def resume_trading_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global trading_enabled
+    trading_enabled = True
+    await update.message.reply_text("▶️ Trading has been RESUMED. The bot can now open new positions.")
+
+async def show_watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = "*--- Primary Watchlist ---*\n"
+    if POTENTIAL_GAPPERS:
+        symbols = [s for s in POTENTIAL_GAPPERS.keys() if not s.endswith('_data')]
+        message += f"`{', '.join(symbols)}`\n\n"
+    else:
+        message += "Empty.\n\n"
+
+    message += "*--- Second Wave Watchlist ---*\n"
+    if SECONDARY_WATCHLIST:
+        symbols = [f"{s} ({d['initial_gap']:.1f}%)" for s, d in SECONDARY_WATCHLIST.items()]
+        message += f"`{', '.join(symbols)}`"
+    else:
+        message += "Empty."
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+async def set_max_positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        new_max = int(context.args[0])
+        if new_max >= 0:
+            SETTINGS.MAX_POSITIONS = new_max
+            await update.message.reply_text(f"⚙️ Max positions set to {new_max}.")
+        else:
+            await update.message.reply_text("Please provide a non-negative number.")
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: /set_max_positions [number]")
+
+async def toggle_pyramiding_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global pyramiding_enabled
+    pyramiding_enabled = not pyramiding_enabled
+    status = "ENABLED" if pyramiding_enabled else "DISABLED"
+    await update.message.reply_text(f"⚙️ Pyramiding is now {status}.")
+
+async def market_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_premarket():
+        status = "PRE-MARKET"
+    elif is_rth():
+        status = "OPEN"
+    else:
+        status = "CLOSED"
+    await update.message.reply_text(f"📈 Market Status: *{status}*", parse_mode='Markdown')
+
+# ==============================================================================
+# --- CORE LOGIC TASKS ---
+# ==============================================================================
+async def premarket_gapper_scanner_task():
+    """Scan Polygon every 5 min for %-gappers and populate POTENTIAL_GAPPERS."""
+    while True:
+        if not is_trading_day():
+            await asyncio.sleep(3600)
+            continue
+        if not is_premarket():
+            await asyncio.sleep(60)
+            continue
+        try:
+            logging.info("Scanning for new potential short targets…")
+            try:
+                raw = await asyncio.to_thread(polygon_rest_client.list_snapshot_tickers, market_type=_POLY_MARKET)
+            except AttributeError:
+                try:
+                    logging.warning("Using legacy get_snapshot_all_tickers endpoint.")
+                    raw = await asyncio.to_thread(polygon_rest_client.get_snapshot_all_tickers)
+                except AttributeError:
+                    logging.warning("Using ancient get_snapshot_all endpoint.")
+                    raw = await asyncio.to_thread(polygon_rest_client.get_snapshot_all, _POLY_MARKET)
+
+            snaps = [_mk_snapshot_from_gapper(r) for r in raw]
+            gainers = sorted([s for s in snaps if s.pct is not None], key=lambda s: s.pct, reverse=True)[:50]
+            logging.info(f"Fetched {len(raw)} rows → {len(gainers)} top gainers found.")
+
+            for snap in gainers:
+                sym = snap.ticker
+                if (
+                    sym not in POTENTIAL_GAPPERS
+                    and sym not in TRADED_SYMBOLS_TODAY
+                    and snap.pct >= SETTINGS.MIN_GAP_PERCENT
+                ):
+                    logging.info(f"Gapper {sym} at {snap.pct:.1f}% → adding to watchlist.")
+                    POTENTIAL_GAPPERS[sym] = datetime.now(timezone.utc)
+                    POTENTIAL_GAPPERS[sym + "_data"] = snap
+
+                    price_str = f"${snap.last:.2f}" if snap.last is not None else "N/A"
+                    send_telegram_alert(f"👀 *New Short Candidate:* `${sym}`\n"
+                                        f"Gap: *{snap.pct:.1f}%* | Price: {price_str}")
+
+        except Exception as e:
+            logging.error(f"Scanner error: {e}", exc_info=True)
+        await asyncio.sleep(300)
+
+async def consistency_and_vetting_task():
+    """Check cached gappers for persistence and enqueue vetted symbols."""
+    SLEEP = 60
+    while True:
+        if not is_trading_day():
+            await asyncio.sleep(3600)
+            continue
+        if not POTENTIAL_GAPPERS:
+            await asyncio.sleep(SLEEP)
+            continue
+        try:
+            logging.info(f"Running consistency check on {len(POTENTIAL_GAPPERS)} watchlist items…")
+            now_utc = datetime.now(timezone.utc)
+            remove: list[str] = []
+            for symbol, first_seen in list(POTENTIAL_GAPPERS.items()):
+                if symbol.endswith("_data"): continue
+                if symbol in TRADED_SYMBOLS_TODAY:
+                    remove.append(symbol)
+                    continue
+                
+                # --- IMMEDIATE ENTRY MODIFICATION ---
+                # The consistency check wait period is bypassed by commenting out this block.
+                # Any gapper found by the scanner will be enqueued for vetting on the
+                # next cycle of this task (which runs every 60 seconds).
+                # if (now_utc - first_seen).total_seconds() < SETTINGS.GAPPER_CONSISTENCY_CHECK_SECONDS:
+                #     continue
+
+                snap = POTENTIAL_GAPPERS.get(f"{symbol}_data")
+                if not snap:
+                    logging.info(f"{symbol}: no snapshot data → drop")
+                    remove.append(symbol)
+                    continue
+
+                pct = float(snap.pct or 0)
+                if pct < SETTINGS.MIN_GAP_PERCENT:
+                    logging.info(f"{symbol} gap faded to {pct:.1f}% → drop")
+                    remove.append(symbol)
+                    continue
+
+                await TRADE_SIGNAL_QUEUE.put({"symbol": symbol, "reason": "Gapper Consistency", "initial_gap_percent": pct})
+                logging.info(f"{symbol} passed consistency → VETTING_QUEUE")
+                remove.append(symbol)
+
+            for sym in remove:
+                POTENTIAL_GAPPERS.pop(sym, None)
+                POTENTIAL_GAPPERS.pop(f"{sym}_data", None)
+        except Exception as exc:
+            logging.error(f"Consistency checker crashed: {exc}", exc_info=True)
+        await asyncio.sleep(SLEEP)
+
+async def candidate_vetting_and_execution_task():
+    """Vets and executes trades from the signal queue (Primary Wave)."""
+    while True:
+        event = await TRADE_SIGNAL_QUEUE.get()
+        symbol = event['symbol']
+        initial_gap_percent = event.get('initial_gap_percent')
+
+        if symbol in TRADED_SYMBOLS_TODAY:
+            TRADE_SIGNAL_QUEUE.task_done()
+            continue
+
+        async with API_SEMAPHORE:
+            logging.info(f"--- VETTING (1st Wave) {symbol} FOR SHORT ---")
+            try:
+                TRADED_SYMBOLS_TODAY.add(symbol)
+
+                asset = await asyncio.to_thread(trading_client.get_asset, symbol)
+                if not asset.tradable:
+                    logging.info(f"FILTERED: {symbol} not tradable.")
+                    continue
+
+                if not asset.shortable or not asset.easy_to_borrow:
+                    logging.warning(f"FILTERED (1st Wave): {symbol} is not shortable. Adding to secondary watchlist.")
+                    snap_data = POTENTIAL_GAPPERS.get(f"{symbol}_data")
+                    price_to_store = snap_data.last if snap_data and snap_data.last is not None else 0.0
+                    SECONDARY_WATCHLIST[symbol] = {'price': price_to_store, 'initial_gap': initial_gap_percent}
+                    send_telegram_alert(f"➡️ `${symbol}` moved to 2nd Wave Watchlist (Gap: {initial_gap_percent:.1f}%)")
+                    continue
+
+                if hasattr(asset, 'shares_outstanding') and asset.shares_outstanding is not None and asset.shares_outstanding > SETTINGS.MAX_SHARES_OUTSTANDING:
+                    logging.info(f"FILTERED: {symbol} shares outstanding ({asset.shares_outstanding}) exceeds max ({SETTINGS.MAX_SHARES_OUTSTANDING}).")
+                    continue
+
+                quote = await get_last_quote_for_symbol(symbol)
+                entry_price = quote.bid_price
+                if not (entry_price > 0):
+                    logging.info(f"FILTERED: {symbol} has invalid quote.")
+                    continue
+
+                if len(OPEN_POSITIONS) < SETTINGS.MAX_POSITIONS and trading_enabled:
+                    logging.info(f"✅ VETTING PASSED (1st Wave): Executing SHORT trade for {symbol}.")
+                    await execute_trade(symbol, OrderSide.SELL, entry_price, initial_gap_percent)
+            except Exception as e:
+                logging.error(f"Error during 1st Wave vetting for {symbol}: {e}", exc_info=True)
+            finally:
+                TRADE_SIGNAL_QUEUE.task_done()
+
+async def execute_trade(symbol: str, side: OrderSide, price: float, initial_gap_percent: Optional[float] = None):
+    """Submits a limit order for entry."""
+    qty = calc_position_size(price)
+    if qty == 0: return
+
+    order_request = LimitOrderRequest(
+        symbol=symbol, qty=qty, side=side, limit_price=price,
+        time_in_force=TimeInForce.DAY, extended_hours=True
+    )
+    log_prefix = "PYRAMID ENTRY" if symbol in OPEN_POSITIONS else "ENTRY"
+    logging.info(f"{log_prefix} {side.name} {qty} {symbol} | Type: LIMIT @ {price} (Extended Hours)")
+    try:
+        trade_order = await asyncio.to_thread(trading_client.submit_order, order_data=order_request)
+        if symbol not in OPEN_POSITIONS:
+            PENDING_ORDERS[trade_order.id] = {"symbol": symbol, "initial_gap_percent": initial_gap_percent}
+        alert_prefix = " pyramiding on" if symbol in OPEN_POSITIONS else ""
+        send_telegram_alert(f"➡️ *Short Order Submitted{alert_prefix}:* {side.value} {qty} ${symbol} @ ${price:.2f}")
+    except Exception as e:
+        logging.error(f"Failed to submit short entry order for {symbol}: {e}")
+
+async def process_filled_order(order: Order):
+    """Processes a filled entry order, creating or updating the position state."""
+    logging.info(f"Entry fill received: {order.side} {order.qty} of {order.symbol} @ ${order.filled_avg_price}")
+    try:
+        position = await asyncio.to_thread(trading_client.get_open_position, order.symbol)
+
+        is_new_position = order.symbol not in OPEN_POSITIONS
+
+        if is_new_position:
+            pending_data = PENDING_ORDERS.get(order.id, {})
+            initial_gap_percent = pending_data.get('initial_gap_percent')
+
+            position_state = "pm_virtual_stop" if is_premarket() else "probe"
+            OPEN_POSITIONS[order.symbol] = {
+                "position_obj": position, "stop_id": None, "state": position_state,
+                "opened_at": datetime.now(timezone.utc), "initial_gap_percent": initial_gap_percent,
+                "last_pyramid_check": datetime.now(timezone.utc)
+            }
+            send_telegram_alert(f"✅ *Short Position Opened:* {order.side} {abs(float(order.filled_qty))} ${order.symbol}\n"
+                                f"Avg Price: ${order.filled_avg_price} | State: *{position_state.upper()}*")
+        else:
+            OPEN_POSITIONS[order.symbol]['position_obj'] = position
+            logging.info(f"Position {order.symbol} updated with new fill. New Qty: {position.qty}")
+
+        if is_new_position and order.symbol not in ANALYZED_SYMBOLS_TODAY:
+            initial_gap = OPEN_POSITIONS[order.symbol].get('initial_gap_percent', 0.0)
+            asyncio.create_task(generate_openai_analysis(order.symbol, initial_gap))
+            ANALYZED_SYMBOLS_TODAY.add(order.symbol)
+
+    except Exception as e:
+        logging.error(f"CRITICAL: FAILED TO PROCESS FILL for {order.symbol}: {e}. LIQUIDATING.")
+        await liquidate_position(order.symbol, "Fill processing failure")
+
+async def handle_trade_updates(trade: TradeUpdate):
+    """Handles trade fills from the stream."""
+    global REALIZED_PNL_TODAY
+    try:
+        if trade.event in ('fill', 'partial_fill'):
+            order = trade.order
+
+            if order.id in PENDING_ORDERS:
+                await process_filled_order(order)
+                if order.status in (QueryOrderStatus.FILLED, QueryOrderStatus.CANCELED, QueryOrderStatus.EXPIRED):
+                    PENDING_ORDERS.pop(order.id, None)
+                    logging.info(f"Entry order {order.id} for {order.symbol} is final, removed from pending.")
+
+            elif order.symbol in OPEN_POSITIONS:
+                if order.side == OrderSide.BUY:
+                    pos_data = OPEN_POSITIONS.get(order.symbol)
+                    if not pos_data: return
+
+                    entry_price = float(pos_data['position_obj'].avg_entry_price)
+                    exit_price = float(trade.price)
+                    qty = abs(float(trade.qty))
+                    realized_pl = qty * (entry_price - exit_price)
+
+                    REALIZED_PNL_TODAY += realized_pl
+                    logging.info(f"TRADE_RESULT {order.symbol} P/L=${realized_pl:.2f}")
+                    send_telegram_alert(f"💰 *Position Covered:* ${order.symbol}\n*P/L:* `${realized_pl:+.2f}`")
+                    OPEN_POSITIONS.pop(order.symbol, None)
+    except Exception as e:
+        logging.error(f"Trade update failure: {e}", exc_info=True)
+
+async def manage_open_positions_task():
+    """Manages virtual stops and RTH stops for short positions."""
+    while True:
+        if not is_trading_day():
+            await asyncio.sleep(3600)
+            continue
+        await asyncio.sleep(10)
+        if not OPEN_POSITIONS: continue
+
+        now_et_time = get_current_et_time()
+
+        for symbol, data in list(OPEN_POSITIONS.items()):
+            try:
+                pos = await asyncio.to_thread(trading_client.get_open_position, symbol)
+                data['position_obj'] = pos
+
+                # --- Stop-Loss Logic ---
+                stop_loss_price = float(pos.avg_entry_price) * (1 + SETTINGS.STOP_LOSS_PERCENT / 100.0)
+
+                if data['state'] == 'pm_virtual_stop':
+                    if float(pos.current_price) >= stop_loss_price:
+                        await liquidate_position(symbol, f"Virtual PM Stop Loss hit at ${float(pos.current_price):.2f}")
+                        continue
+                    if is_rth():
+                        logging.info(f"Transitioning {symbol} from PM to RTH probe state.")
+                        data['state'] = 'probe'
+
+                if data['state'] == 'probe' and is_rth() and now_et_time >= dtime(9, 40) and not data.get('stop_id'):
+                    logging.info(f"Past 9:40 AM ET, placing stop for {symbol}.")
+                    stop_req = StopOrderRequest(
+                        symbol=symbol, qty=abs(float(pos.qty)), side=OrderSide.BUY,
+                        time_in_force=TimeInForce.GTC, stop_price=round(stop_loss_price, 2)
+                    )
+                    stop_order = await asyncio.to_thread(trading_client.submit_order, order_data=stop_req)
+                    data['stop_id'] = stop_order.id
+                    data['state'] = 'active_short'
+                    logging.info(f"Placed RTH buy-stop for {symbol} @ {stop_loss_price:.2f}. State -> ACTIVE_SHORT.")
+                    send_telegram_alert(f"🛡️ *RTH Stop Placed* for ${symbol} @ ${stop_loss_price:.2f}")
+
+            except APIError as e:
+                if "position not found" in str(e):
+                    logging.warning(f"Position {symbol} seems to be closed. Removing from local state.")
+                    OPEN_POSITIONS.pop(symbol, None)
+                else:
+                    logging.error(f"API Error managing {symbol}: {e}")
+            except Exception as e:
+                logging.error(f"Error managing {symbol}: {e}", exc_info=True)
+
+async def run_trading_stream():
+    """Run Alpaca TradingStream inside the current asyncio loop."""
+    logging.info("run_trading_stream consumer started.")
+    try:
+        await trading_stream._run_forever()
+    except Exception as exc:
+        logging.error(f"Trading stream terminated: {exc}")
+        raise
+
+# ==============================================================================
+# --- SECONDARY LOGIC TASKS ---
+# ==============================================================================
+async def second_wave_revetting_task():
+    """
+    At 10:00 AM ET, re-evaluates non-shortable candidates from pre-market.
+    """
+    global second_wave_triggered_today
+    while True:
+        await asyncio.sleep(30)
+        if not is_trading_day():
+            await asyncio.sleep(3600)
+            continue
+
+        now_et = get_current_et_time()
+        if is_rth() and now_et >= dtime(10, 0) and not second_wave_triggered_today:
+            logging.warning("--- INITIATING SECOND WAVE RE-VETTING ---")
+            second_wave_triggered_today = True
+
+            if not SECONDARY_WATCHLIST:
+                logging.info("Second wave watchlist is empty. No action needed.")
+                continue
+
+            send_telegram_alert(f"🌊 *Second Wave Started!* Re-vetting {len(SECONDARY_WATCHLIST)} candidates for shortability.")
+
+            for symbol, data in list(SECONDARY_WATCHLIST.items()):
+                async with API_SEMAPHORE:
+                    if symbol in OPEN_POSITIONS: continue
+
+                    logging.info(f"--- VETTING (2nd Wave) {symbol} FOR SHORT ---")
+                    try:
+                        initial_gap = data['initial_gap']
+                        high_price = data['price']
+
+                        snapshot = await get_snapshot_for_symbol(symbol)
+                        current_gap = snapshot.ticker.todays_change_perc
+
+                        if current_gap < initial_gap:
+                            logging.info(f"FILTERED (2nd Wave): {symbol} gap faded to {current_gap:.1f}%. Initial was {initial_gap:.1f}%.")
+                            continue
+
+                        asset = await asyncio.to_thread(trading_client.get_asset, symbol)
+
+                        if asset.shortable and asset.easy_to_borrow:
+                            logging.info(f"✅ VETTING PASSED (2nd Wave): {symbol} is now shortable!")
+
+                            price_to_use = high_price if high_price and high_price > 0 else snapshot.ticker.last_trade.price
+                            if len(OPEN_POSITIONS) < SETTINGS.MAX_POSITIONS and trading_enabled:
+                                await execute_trade(symbol, OrderSide.SELL, price_to_use, current_gap)
+                        else:
+                            logging.info(f"FILTERED (2nd Wave): {symbol} is still not shortable.")
+
+                    except Exception as e:
+                        logging.error(f"Error during 2nd Wave vetting for {symbol}: {e}")
+
+            SECONDARY_WATCHLIST.clear()
+            logging.warning("--- SECOND WAVE RE-VETTING COMPLETE ---")
+
+async def pyramid_positions_task():
+    """Hourly check to add to positions that have gapped up further."""
+    while True:
+        await asyncio.sleep(60 * 15)
+        if not is_trading_day() or not is_rth() or not OPEN_POSITIONS or not pyramiding_enabled:
+            continue
+
+        logging.info("Running hourly pyramid check on open positions...")
+        now_utc = datetime.now(timezone.utc)
+
+        for symbol, data in list(OPEN_POSITIONS.items()):
+            last_check = data.get('last_pyramid_check', now_utc - timedelta(hours=2))
+            if (now_utc - last_check).total_seconds() < 3600:
+                continue
+
+            initial_gap = data.get('initial_gap_percent')
+            if not initial_gap:
+                data['last_pyramid_check'] = now_utc
+                continue
+
+            logging.info(f"Checking pyramid condition for {symbol} (Initial Gap: {initial_gap:.1f}%)")
+            try:
+                snapshot = await get_snapshot_for_symbol(symbol)
+                current_gap = snapshot.ticker.todays_change_perc
+
+                if current_gap >= initial_gap + 5:
+                    logging.warning(f"PYRAMID CONDITION MET for {symbol}! Current Gap: {current_gap:.1f}% > Initial: {initial_gap:.1f}% + 5.")
+                    send_telegram_alert(f" pyramiding on `${symbol}`. Gap increased to {current_gap:.1f}%.")
+
+                    await execute_trade(symbol, OrderSide.SELL, snapshot.ticker.last_trade.price, initial_gap)
+                else:
+                    logging.info(f"Pyramid condition not met for {symbol}. Current Gap: {current_gap:.1f}%")
+
+                data['last_pyramid_check'] = now_utc
+
+            except Exception as e:
+                logging.error(f"Error during pyramid check for {symbol}: {e}")
+                data['last_pyramid_check'] = now_utc
+
+# ==============================================================================
+# --- BACKGROUND & MAIN TASKS ---
+# ==============================================================================
+async def run_heartbeat():
+    """Logs the bot's status periodically."""
+    while True:
+        await asyncio.sleep(60)
+        sim_status = f" (SIMULATING {SETTINGS.SIMULATED_ET_HOUR}:00 ET)" if SETTINGS.SIMULATION_MODE else ""
+        watchlist_count = len(POTENTIAL_GAPPERS) // 2
+        logging.info(f"Heartbeat: Vetting Queue={TRADE_SIGNAL_QUEUE.qsize()}, Watchlist={watchlist_count}, 2ndWave={len(SECONDARY_WATCHLIST)}, Open Shorts={len(OPEN_POSITIONS)}{sim_status}")
+
+async def telegram_heartbeat():
+    """Sends a periodic 'I'm alive' message to Telegram."""
+    while True:
+        await asyncio.sleep(SETTINGS.TELEGRAM_HEARTBEAT_INTERVAL)
+        try:
+            open_pos_count = len(OPEN_POSITIONS)
+            sim_status = f" (Simulating {SETTINGS.SIMULATED_ET_HOUR}:00 ET)" if SETTINGS.SIMULATION_MODE else ""
+            send_telegram_alert(f"⏳ Heartbeat OK – {open_pos_count} open short positions.{sim_status}")
+        except Exception as e:
+            logging.error(f"Telegram heartbeat failed: {e}")
+
+async def daily_reset_task():
+    """Resets daily flags and lists."""
+    global trading_enabled, pyramiding_enabled, second_wave_triggered_today
+    while True:
+        now_et = datetime.now(ET)
+        if now_et.hour == 1 and now_et.minute == 0 and not SETTINGS.SIMULATION_MODE:
+            logging.info("--- Performing daily reset ---")
+            send_telegram_alert("☀️ *Good Morning!* Performing daily reset for Short_King.")
+            trading_enabled = True
+            pyramiding_enabled = True
+            second_wave_triggered_today = False
+            TRADED_SYMBOLS_TODAY.clear()
+            POTENTIAL_GAPPERS.clear()
+            SECONDARY_WATCHLIST.clear()
+            ANALYZED_SYMBOLS_TODAY.clear()
+            REALIZED_PNL_TODAY = 0.0
+            logging.info("Daily flags, watchlists, and PnL reset.")
+            await asyncio.sleep(3600)
+        await asyncio.sleep(60)
+
+# async def end_of_day_close_task():
+#     """(DISABLED) Closes all positions at 16:25 ET as a safety net."""
+#     ...
+
+async def sync_positions_on_startup():
+    """Queries Alpaca for existing positions and syncs the internal state."""
+    logging.info("Attempting to sync with existing Alpaca positions...")
+    try:
+        existing_positions = await asyncio.to_thread(trading_client.get_all_positions)
+        if not existing_positions:
+            logging.info("No existing positions found in Alpaca account.")
+            return
+
+        logging.info(f"Found {len(existing_positions)} existing positions. Syncing short positions now...")
+        for pos in existing_positions:
+            if pos.side == 'short':
+                logging.warning(f"Synced existing short position: {pos.qty} of {pos.symbol} @ ${pos.avg_entry_price}. State set to 'probe'.")
+                OPEN_POSITIONS[pos.symbol] = {
+                    "position_obj": pos, "stop_id": None, "state": "probe",
+                    "opened_at": datetime.now(timezone.utc), "initial_gap_percent": None,
+                    "last_pyramid_check": datetime.now(timezone.utc)
+                }
+                TRADED_SYMBOLS_TODAY.add(pos.symbol)
+
+                if pos.symbol not in ANALYZED_SYMBOLS_TODAY:
+                    try:
+                        snapshot = await get_snapshot_for_symbol(pos.symbol)
+                        current_gap = snapshot.ticker.todays_change_perc if snapshot and hasattr(snapshot, 'ticker') else 0.0
+                        asyncio.create_task(generate_openai_analysis(pos.symbol, current_gap))
+                        ANALYZED_SYMBOLS_TODAY.add(pos.symbol)
+                    except Exception as e:
+                        logging.error(f"Error getting snapshot for AI analysis on sync {pos.symbol}: {e}")
+
+        logging.info(f"Sync complete. Internal state now tracking {len(OPEN_POSITIONS)} short positions.")
+    except Exception as e:
+        logging.error(f"Failed to sync existing positions: {e}", exc_info=True)
+
+async def main():
+    """The main entry point for the bot."""
+    check_environment_variables()
+    logging.info(f"--- Initializing Short_King.py v4.0 ---")
+
+    try:
+        account = await asyncio.to_thread(trading_client.get_account)
+        logging.info(f"Account equity: ${float(account.equity):,.2f}.")
+    except Exception as e:
+        logging.critical(f"Failed to initialize Alpaca client: {e}", exc_info=True)
+        sys.exit(1)
+
+    await sync_positions_on_startup()
+
+    send_telegram_alert(f"🤖 *Short King Bot Initializing...* Version 4.0. Now tracking {len(OPEN_POSITIONS)} existing positions.")
+
+    if TELEGRAM_BOT_TOKEN:
+        app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+        app.add_handler(CommandHandler("start", start_command))
+        app.add_handler(CommandHandler("status", status_command))
+        app.add_handler(CommandHandler("openpositions", positions_command))
+        app.add_handler(CommandHandler("pnl", pnl_command))
+        app.add_handler(CommandHandler("refresh_insights", refresh_insights_command))
+        app.add_handler(CommandHandler("liquidate", liquidate_command))
+        app.add_handler(CommandHandler("close_all", close_all_command))
+        app.add_handler(CommandHandler("pause_trading", pause_trading_command))
+        app.add_handler(CommandHandler("resume_trading", resume_trading_command))
+        app.add_handler(CommandHandler("show_watchlist", show_watchlist_command))
+        app.add_handler(CommandHandler("set_max_positions", set_max_positions_command))
+        app.add_handler(CommandHandler("toggle_pyramiding", toggle_pyramiding_command))
+        app.add_handler(CommandHandler("market_status", market_status_command))
+
+        await app.initialize()
+        await app.start()
+        asyncio.create_task(app.updater.start_polling())
+
+    trading_stream.subscribe_trade_updates(handle_trade_updates)
+
+    tasks = [
+        run_trading_stream(),
+        premarket_gapper_scanner_task(),
+        consistency_and_vetting_task(),
+        candidate_vetting_and_execution_task(),
+        manage_open_positions_task(),
+        second_wave_revetting_task(),
+        pyramid_positions_task(),
+        run_heartbeat(),
+        telegram_heartbeat(),
+        daily_reset_task(),
+    ]
+    await asyncio.gather(*tasks)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Shutdown signal received.")
+    finally:
+        logging.info("--- TRADING BOT SHUT DOWN ---")
+        send_telegram_alert("⏹️ *Short King bot shutdown complete.*")
