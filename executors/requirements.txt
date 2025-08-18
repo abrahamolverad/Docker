@@ -16,3 +16,4 @@ numpy==1.26.4
 python-binance
 requests
 polygon-api-client
+openai==1.40.2
