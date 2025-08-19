@@ -1,14 +1,15 @@
 # ==============================================================================
-# --- AUTONOMOUS TRADING ALGORITHM (Short_King.py v4.0) ---
+# --- AUTONOMOUS TRADING ALGORITHM (Short_King.py v4.2) ---
 #
-# v4.0 UPDATE:
-# - STOP-LOSS ENABLED: A 10% stop-loss is now automatically placed for all
-#   positions. It's a virtual stop during pre-market and becomes a GTC
-#   order during regular trading hours.
-# - TRADE SIZE REDUCED: Notional trade value reduced to $1,000 per position.
-# - IMMEDIATE ENTRY: The consistency check for gappers has been removed.
-#   The bot will now attempt to enter a trade immediately after a stock
-#   gapping over 30% is detected.
+# v4.2 UPDATE:
+# - WIDENED FILTERS: Scanner now considers top 200 gainers. Vetting filters
+#   for shares outstanding (100M) and PM volume (10k) have been loosened.
+# - RENDER CRASH FIX: Resolved a ValidationError during position liquidation
+#   by specifying percentage="1.0" in the ClosePositionRequest.
+# - ROBUSTNESS: Added error handling for snapshot fetching to prevent crashes
+#   in AI analysis and position management tasks.
+# - STARTUP SYNC: Now syncs existing open orders to prevent duplicate stop-loss
+#   placement errors on previously opened positions.
 #
 # WARNING: THE AUTOMATIC END-OF-DAY POSITION CLOSING FEATURE HAS BEEN DISABLED.
 # POSITIONS WILL BE HELD OVERNIGHT UNLESS MANUALLY CLOSED.
@@ -33,7 +34,7 @@ from types import SimpleNamespace
 
 # --- Vendor Client Imports ---
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, StopOrderRequest, ClosePositionRequest
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, StopOrderRequest, ClosePositionRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.trading.models import TradeUpdate, Position, Order
 from alpaca.trading.stream import TradingStream
@@ -60,9 +61,9 @@ class Settings:
     MIN_PRICE: float = 0.1
     MAX_PRICE: float = 1000.0
     MIN_AVG_DOLLAR_VOLUME: float = 100_000
-    MIN_PM_VOLUME: int = 25000
+    MIN_PM_VOLUME: int = 10000
     MIN_NOTIONAL_VALUE: float = 5_000.0
-    MAX_SHARES_OUTSTANDING: int = 50_000_000
+    MAX_SHARES_OUTSTANDING: int = 100_000_000
     MIN_ATR_PERCENT: float = 3.0
     MAX_SPREAD_PERCENT: float = 1.5
     MIN_GAP_PERCENT: float = 30.0
@@ -238,7 +239,10 @@ async def liquidate_position(symbol: str, reason: str):
                 except APIError as e:
                     logging.error(f"Could not cancel stop order for {symbol}: {e}")
 
-            close_request = ClosePositionRequest(symbol_or_asset_id=symbol)
+            # --- RENDER CRASH FIX ---
+            # The ClosePositionRequest requires either a qty or percentage.
+            # To close the entire position, we specify percentage="1.0".
+            close_request = ClosePositionRequest(symbol_or_asset_id=symbol, percentage="1.0")
             await asyncio.to_thread(trading_client.close_position, close_request)
             send_telegram_alert(f"🚨 *LIQUIDATED:* Position ${symbol} closed. Reason: {reason}.")
             OPEN_POSITIONS.pop(symbol, None)
@@ -323,6 +327,13 @@ async def get_market_context() -> str:
             get_snapshot_for_symbol("SPY"),
             get_snapshot_for_symbol("QQQ")
         )
+        
+        # --- ROBUSTNESS FIX ---
+        # Ensure snapshots are valid objects before accessing attributes.
+        if not hasattr(spy_snapshot, 'ticker') or not hasattr(qqq_snapshot, 'ticker'):
+            logging.error("Could not get valid snapshot for SPY or QQQ.")
+            return "Unknown"
+            
         spy_change = spy_snapshot.ticker.todays_change_perc
         qqq_change = qqq_snapshot.ticker.todays_change_perc
 
@@ -405,7 +416,7 @@ async def generate_openai_analysis(symbol: str, initial_gap_percent: Optional[fl
 # --- TELEGRAM BOT COMMANDS ---
 # ==============================================================================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = f"*Short_King.py v4.0* is running."
+    text = f"*Short_King.py v4.2* is running."
     await update.message.reply_text(text, parse_mode='Markdown')
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -450,7 +461,8 @@ async def refresh_insights_command(update: Update, context: ContextTypes.DEFAULT
         if not initial_gap:
             try:
                 snapshot = await get_snapshot_for_symbol(symbol)
-                if snapshot and not isinstance(snapshot, str) and hasattr(snapshot, 'ticker'):
+                # --- ROBUSTNESS FIX ---
+                if snapshot and hasattr(snapshot, 'ticker'):
                     initial_gap = snapshot.ticker.todays_change_perc
                 else:
                     logging.warning(f"Invalid snapshot data received for {symbol} during refresh.")
@@ -555,7 +567,8 @@ async def premarket_gapper_scanner_task():
                     raw = await asyncio.to_thread(polygon_rest_client.get_snapshot_all, _POLY_MARKET)
 
             snaps = [_mk_snapshot_from_gapper(r) for r in raw]
-            gainers = sorted([s for s in snaps if s.pct is not None], key=lambda s: s.pct, reverse=True)[:50]
+            # --- WIDENED FILTER --- Changed slice from [:50] to [:200]
+            gainers = sorted([s for s in snaps if s.pct is not None], key=lambda s: s.pct, reverse=True)[:200]
             logging.info(f"Fetched {len(raw)} rows → {len(gainers)} top gainers found.")
 
             for snap in gainers:
@@ -597,10 +610,6 @@ async def consistency_and_vetting_task():
                     remove.append(symbol)
                     continue
                 
-                # --- IMMEDIATE ENTRY MODIFICATION ---
-                # The consistency check wait period is bypassed by commenting out this block.
-                # Any gapper found by the scanner will be enqueued for vetting on the
-                # next cycle of this task (which runs every 60 seconds).
                 # if (now_utc - first_seen).total_seconds() < SETTINGS.GAPPER_CONSISTENCY_CHECK_SECONDS:
                 #     continue
 
@@ -706,14 +715,13 @@ async def process_filled_order(order: Order):
             pending_data = PENDING_ORDERS.get(order.id, {})
             initial_gap_percent = pending_data.get('initial_gap_percent')
 
-            position_state = "pm_virtual_stop" if is_premarket() else "probe"
             OPEN_POSITIONS[order.symbol] = {
-                "position_obj": position, "stop_id": None, "state": position_state,
+                "position_obj": position, "stop_id": None, "state": "monitoring",
                 "opened_at": datetime.now(timezone.utc), "initial_gap_percent": initial_gap_percent,
                 "last_pyramid_check": datetime.now(timezone.utc)
             }
             send_telegram_alert(f"✅ *Short Position Opened:* {order.side} {abs(float(order.filled_qty))} ${order.symbol}\n"
-                                f"Avg Price: ${order.filled_avg_price} | State: *{position_state.upper()}*")
+                                f"Avg Price: ${order.filled_avg_price}")
         else:
             OPEN_POSITIONS[order.symbol]['position_obj'] = position
             logging.info(f"Position {order.symbol} updated with new fill. New Qty: {position.qty}")
@@ -736,7 +744,7 @@ async def handle_trade_updates(trade: TradeUpdate):
 
             if order.id in PENDING_ORDERS:
                 await process_filled_order(order)
-                if order.status in (QueryOrderStatus.FILLED, QueryOrderStatus.CANCELED, QueryOrderStatus.EXPIRED):
+                if order.status in ('filled', 'canceled', 'expired'):
                     PENDING_ORDERS.pop(order.id, None)
                     logging.info(f"Entry order {order.id} for {order.symbol} is final, removed from pending.")
 
@@ -745,20 +753,21 @@ async def handle_trade_updates(trade: TradeUpdate):
                     pos_data = OPEN_POSITIONS.get(order.symbol)
                     if not pos_data: return
 
-                    entry_price = float(pos_data['position_obj'].avg_entry_price)
-                    exit_price = float(trade.price)
-                    qty = abs(float(trade.qty))
-                    realized_pl = qty * (entry_price - exit_price)
+                    if order.status == 'filled':
+                        entry_price = float(pos_data['position_obj'].avg_entry_price)
+                        exit_price = float(order.filled_avg_price)
+                        qty = abs(float(order.filled_qty))
+                        realized_pl = qty * (entry_price - exit_price)
 
-                    REALIZED_PNL_TODAY += realized_pl
-                    logging.info(f"TRADE_RESULT {order.symbol} P/L=${realized_pl:.2f}")
-                    send_telegram_alert(f"💰 *Position Covered:* ${order.symbol}\n*P/L:* `${realized_pl:+.2f}`")
-                    OPEN_POSITIONS.pop(order.symbol, None)
+                        REALIZED_PNL_TODAY += realized_pl
+                        logging.info(f"TRADE_RESULT {order.symbol} P/L=${realized_pl:.2f}")
+                        send_telegram_alert(f"💰 *Position Covered:* ${order.symbol}\n*P/L:* `${realized_pl:+.2f}`")
+                        OPEN_POSITIONS.pop(order.symbol, None)
     except Exception as e:
         logging.error(f"Trade update failure: {e}", exc_info=True)
 
 async def manage_open_positions_task():
-    """Manages virtual stops and RTH stops for short positions."""
+    """Manages stops for short positions. Uses a virtual stop pre-market and places a real GTC stop at market open."""
     while True:
         if not is_trading_day():
             await asyncio.sleep(3600)
@@ -766,35 +775,30 @@ async def manage_open_positions_task():
         await asyncio.sleep(10)
         if not OPEN_POSITIONS: continue
 
-        now_et_time = get_current_et_time()
-
         for symbol, data in list(OPEN_POSITIONS.items()):
             try:
                 pos = await asyncio.to_thread(trading_client.get_open_position, symbol)
                 data['position_obj'] = pos
 
-                # --- Stop-Loss Logic ---
                 stop_loss_price = float(pos.avg_entry_price) * (1 + SETTINGS.STOP_LOSS_PERCENT / 100.0)
 
-                if data['state'] == 'pm_virtual_stop':
-                    if float(pos.current_price) >= stop_loss_price:
-                        await liquidate_position(symbol, f"Virtual PM Stop Loss hit at ${float(pos.current_price):.2f}")
-                        continue
-                    if is_rth():
-                        logging.info(f"Transitioning {symbol} from PM to RTH probe state.")
-                        data['state'] = 'probe'
-
-                if data['state'] == 'probe' and is_rth() and now_et_time >= dtime(9, 40) and not data.get('stop_id'):
-                    logging.info(f"Past 9:40 AM ET, placing stop for {symbol}.")
-                    stop_req = StopOrderRequest(
-                        symbol=symbol, qty=abs(float(pos.qty)), side=OrderSide.BUY,
-                        time_in_force=TimeInForce.GTC, stop_price=round(stop_loss_price, 2)
-                    )
-                    stop_order = await asyncio.to_thread(trading_client.submit_order, order_data=stop_req)
-                    data['stop_id'] = stop_order.id
-                    data['state'] = 'active_short'
-                    logging.info(f"Placed RTH buy-stop for {symbol} @ {stop_loss_price:.2f}. State -> ACTIVE_SHORT.")
-                    send_telegram_alert(f"🛡️ *RTH Stop Placed* for ${symbol} @ ${stop_loss_price:.2f}")
+                if not data.get('stop_id'):
+                    if is_premarket():
+                        data['state'] = 'pm_virtual_stop'
+                        if float(pos.current_price) >= stop_loss_price:
+                            await liquidate_position(symbol, f"Virtual PM Stop Loss hit at ${float(pos.current_price):.2f}")
+                            continue
+                    elif is_rth():
+                        logging.info(f"Market is open. Placing real GTC stop for {symbol}.")
+                        stop_req = StopOrderRequest(
+                            symbol=symbol, qty=abs(float(pos.qty)), side=OrderSide.BUY,
+                            time_in_force=TimeInForce.GTC, stop_price=round(stop_loss_price, 2)
+                        )
+                        stop_order = await asyncio.to_thread(trading_client.submit_order, order_data=stop_req)
+                        data['stop_id'] = stop_order.id
+                        data['state'] = 'active_short'
+                        logging.info(f"Placed GTC buy-stop for {symbol} @ {stop_loss_price:.2f}. State -> ACTIVE_SHORT.")
+                        send_telegram_alert(f"🛡️ *GTC Stop Placed* for ${symbol} @ ${stop_loss_price:.2f}")
 
             except APIError as e:
                 if "position not found" in str(e):
@@ -804,6 +808,7 @@ async def manage_open_positions_task():
                     logging.error(f"API Error managing {symbol}: {e}")
             except Exception as e:
                 logging.error(f"Error managing {symbol}: {e}", exc_info=True)
+
 
 async def run_trading_stream():
     """Run Alpaca TradingStream inside the current asyncio loop."""
@@ -895,6 +900,12 @@ async def pyramid_positions_task():
             logging.info(f"Checking pyramid condition for {symbol} (Initial Gap: {initial_gap:.1f}%)")
             try:
                 snapshot = await get_snapshot_for_symbol(symbol)
+                # --- ROBUSTNESS FIX ---
+                if not snapshot or not hasattr(snapshot, 'ticker'):
+                    logging.warning(f"Could not get valid snapshot for {symbol} during pyramid check.")
+                    data['last_pyramid_check'] = now_utc
+                    continue
+                
                 current_gap = snapshot.ticker.todays_change_perc
 
                 if current_gap >= initial_gap + 5:
@@ -966,12 +977,26 @@ async def sync_positions_on_startup():
             logging.info("No existing positions found in Alpaca account.")
             return
 
+        # --- STARTUP SYNC IMPROVEMENT ---
+        # Fetch open orders to link them to existing positions.
+        open_orders = await asyncio.to_thread(trading_client.get_orders, GetOrdersRequest(status=QueryOrderStatus.OPEN))
+        orders_by_symbol = {o.symbol: o for o in open_orders}
+        logging.info(f"Found {len(open_orders)} open orders to sync.")
+
         logging.info(f"Found {len(existing_positions)} existing positions. Syncing short positions now...")
         for pos in existing_positions:
             if pos.side == 'short':
-                logging.warning(f"Synced existing short position: {pos.qty} of {pos.symbol} @ ${pos.avg_entry_price}. State set to 'probe'.")
+                stop_order_id = None
+                # Check if there's a matching open stop order for this position.
+                if pos.symbol in orders_by_symbol:
+                    order = orders_by_symbol[pos.symbol]
+                    if order.side == OrderSide.BUY and order.order_type == 'stop' and float(order.qty) == abs(float(pos.qty)):
+                        stop_order_id = order.id
+                        logging.info(f"Found existing stop order {order.id} for synced position {pos.symbol}.")
+
+                logging.warning(f"Synced existing short position: {pos.qty} of {pos.symbol} @ ${pos.avg_entry_price}. State set to 'monitoring'.")
                 OPEN_POSITIONS[pos.symbol] = {
-                    "position_obj": pos, "stop_id": None, "state": "probe",
+                    "position_obj": pos, "stop_id": stop_order_id, "state": "monitoring",
                     "opened_at": datetime.now(timezone.utc), "initial_gap_percent": None,
                     "last_pyramid_check": datetime.now(timezone.utc)
                 }
@@ -980,7 +1005,13 @@ async def sync_positions_on_startup():
                 if pos.symbol not in ANALYZED_SYMBOLS_TODAY:
                     try:
                         snapshot = await get_snapshot_for_symbol(pos.symbol)
-                        current_gap = snapshot.ticker.todays_change_perc if snapshot and hasattr(snapshot, 'ticker') else 0.0
+                        # --- ROBUSTNESS FIX ---
+                        current_gap = 0.0
+                        if snapshot and hasattr(snapshot, 'ticker'):
+                            current_gap = snapshot.ticker.todays_change_perc
+                        else:
+                            logging.error(f"Error getting snapshot for AI analysis on sync {pos.symbol}")
+                        
                         asyncio.create_task(generate_openai_analysis(pos.symbol, current_gap))
                         ANALYZED_SYMBOLS_TODAY.add(pos.symbol)
                     except Exception as e:
@@ -990,10 +1021,11 @@ async def sync_positions_on_startup():
     except Exception as e:
         logging.error(f"Failed to sync existing positions: {e}", exc_info=True)
 
+
 async def main():
     """The main entry point for the bot."""
     check_environment_variables()
-    logging.info(f"--- Initializing Short_King.py v4.0 ---")
+    logging.info(f"--- Initializing Short_King.py v4.2 ---")
 
     try:
         account = await asyncio.to_thread(trading_client.get_account)
@@ -1004,7 +1036,7 @@ async def main():
 
     await sync_positions_on_startup()
 
-    send_telegram_alert(f"🤖 *Short King Bot Initializing...* Version 4.0. Now tracking {len(OPEN_POSITIONS)} existing positions.")
+    send_telegram_alert(f"🤖 *Short King Bot Initializing...* Version 4.2. Now tracking {len(OPEN_POSITIONS)} existing positions.")
 
     if TELEGRAM_BOT_TOKEN:
         app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
