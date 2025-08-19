@@ -17,3 +17,5 @@ python-binance
 requests
 polygon-api-client
 openai==1.40.2
+tenacity
+pydantic
