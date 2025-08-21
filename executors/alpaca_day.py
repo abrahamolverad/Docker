@@ -1,15 +1,15 @@
 # ==============================================================================
-# --- AUTONOMOUS TRADING ALGORITHM (Short_King.py v4.2) ---
+# --- AUTONOMOUS TRADING ALGORITHM (Short_King.py v4.3) ---
 #
-# v4.2 UPDATE:
-# - WIDENED FILTERS: Scanner now considers top 200 gainers. Vetting filters
-#   for shares outstanding (100M) and PM volume (10k) have been loosened.
-# - RENDER CRASH FIX: Resolved a ValidationError during position liquidation
-#   by specifying percentage="1.0" in the ClosePositionRequest.
-# - ROBUSTNESS: Added error handling for snapshot fetching to prevent crashes
-#   in AI analysis and position management tasks.
-# - STARTUP SYNC: Now syncs existing open orders to prevent duplicate stop-loss
-#   placement errors on previously opened positions.
+# v4.3 UPDATE:
+# - FULL UNIVERSE SCAN: Now uses a paginated Polygon client to fetch all
+#   ~11k snapshots instead of a capped list, ensuring no gappers are missed.
+# - SCANNER STATS: Added detailed logging for how many tickers are filtered
+#   out during the initial gapper scan and for what reasons.
+# - VETTING OBSERVABILITY: Vetting logic now logs the specific reason why any
+#   given candidate is dropped, improving transparency.
+# - TELEGRAM ROBUSTNESS: Added a conflict guard to clear any existing webhooks
+#   on startup, preventing issues when restarting the bot.
 #
 # WARNING: THE AUTOMATIC END-OF-DAY POSITION CLOSING FEATURE HAS BEEN DISABLED.
 # POSITIONS WILL BE HELD OVERNIGHT UNLESS MANUALLY CLOSED.
@@ -196,15 +196,15 @@ def _mk_snapshot_from_gapper(gapper):
         day = gapper.get("day", {})
         return SimpleNamespace(
             ticker=gapper.get("ticker") or gapper.get("T"),
-            pct=gapper.get("todays_change_percent") or gapper.get("todaysChangePerc") or gapper.get("P"),
-            volume=gapper.get("volume") or day.get("v"),
-            last=gapper.get("last") or day.get("c"),
+            pct=gapper.get("todaysChangePerc") or gapper.get("todays_change_percent") or gapper.get("P"),
+            volume=gapper.get("day", {}).get("v") if gapper.get("day") else gapper.get("volume"),
+            last=gapper.get("day", {}).get("c") if gapper.get("day") else gapper.get("last"),
         )
     return SimpleNamespace(
         ticker=getattr(gapper, "ticker", None),
         pct=getattr(gapper, "todays_change_percent", None) or getattr(gapper, "pct", None),
-        volume=getattr(gapper, "volume", None) or getattr(getattr(gapper, "day", None) or (), "v", None),
-        last=getattr(gapper, "last", None) or getattr(getattr(gapper, "day", None) or (), "c", None),
+        volume=getattr(getattr(gapper, "day", None) or (), "v", None),
+        last=getattr(getattr(gapper, "day", None) or (), "c", None),
     )
 
 async def get_last_quote_for_symbol(symbol: str):
@@ -227,6 +227,26 @@ async def get_snapshot_for_symbol(symbol: str):
         if hasattr(client, "close"):
             client.close()
 
+# --- Polygon pagination helper: get ALL snapshot tickers ---
+def fetch_all_snapshot_tickers(limit: int = 1000) -> list[dict]:
+    """Fetch US stock snapshots from Polygon with pagination (cursor)."""
+    import requests
+    base = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers"
+    params = {"limit": limit, "apiKey": POLYGON_API_KEY}
+    out = []
+    url = base
+    while True:
+        resp = requests.get(url, params=params, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        out.extend(data.get("tickers", []))
+        next_url = data.get("next_url")
+        if not next_url:
+            break
+        url = next_url
+        params = {"apiKey": POLYGON_API_KEY}
+    return out
+
 async def liquidate_position(symbol: str, reason: str):
     """Closes a specific position with a market order."""
     logging.warning(f"LIQUIDATING {symbol} due to: {reason}")
@@ -239,9 +259,6 @@ async def liquidate_position(symbol: str, reason: str):
                 except APIError as e:
                     logging.error(f"Could not cancel stop order for {symbol}: {e}")
 
-            # --- RENDER CRASH FIX ---
-            # The ClosePositionRequest requires either a qty or percentage.
-            # To close the entire position, we specify percentage="1.0".
             close_request = ClosePositionRequest(symbol_or_asset_id=symbol, percentage="1.0")
             await asyncio.to_thread(trading_client.close_position, close_request)
             send_telegram_alert(f"🚨 *LIQUIDATED:* Position ${symbol} closed. Reason: {reason}.")
@@ -327,13 +344,11 @@ async def get_market_context() -> str:
             get_snapshot_for_symbol("SPY"),
             get_snapshot_for_symbol("QQQ")
         )
-        
-        # --- ROBUSTNESS FIX ---
-        # Ensure snapshots are valid objects before accessing attributes.
+
         if not hasattr(spy_snapshot, 'ticker') or not hasattr(qqq_snapshot, 'ticker'):
             logging.error("Could not get valid snapshot for SPY or QQQ.")
             return "Unknown"
-            
+
         spy_change = spy_snapshot.ticker.todays_change_perc
         qqq_change = qqq_snapshot.ticker.todays_change_perc
 
@@ -416,7 +431,7 @@ async def generate_openai_analysis(symbol: str, initial_gap_percent: Optional[fl
 # --- TELEGRAM BOT COMMANDS ---
 # ==============================================================================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = f"*Short_King.py v4.2* is running."
+    text = f"*Short_King.py v4.3* is running."
     await update.message.reply_text(text, parse_mode='Markdown')
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -461,7 +476,6 @@ async def refresh_insights_command(update: Update, context: ContextTypes.DEFAULT
         if not initial_gap:
             try:
                 snapshot = await get_snapshot_for_symbol(symbol)
-                # --- ROBUSTNESS FIX ---
                 if snapshot and hasattr(snapshot, 'ticker'):
                     initial_gap = snapshot.ticker.todays_change_perc
                 else:
@@ -556,27 +570,31 @@ async def premarket_gapper_scanner_task():
             continue
         try:
             logging.info("Scanning for new potential short targets…")
-            try:
-                raw = await asyncio.to_thread(polygon_rest_client.list_snapshot_tickers, market_type=_POLY_MARKET)
-            except AttributeError:
-                try:
-                    logging.warning("Using legacy get_snapshot_all_tickers endpoint.")
-                    raw = await asyncio.to_thread(polygon_rest_client.get_snapshot_all_tickers)
-                except AttributeError:
-                    logging.warning("Using ancient get_snapshot_all endpoint.")
-                    raw = await asyncio.to_thread(polygon_rest_client.get_snapshot_all, _POLY_MARKET)
+            raw = await asyncio.to_thread(fetch_all_snapshot_tickers)
+            total_fetched = len(raw)
 
             snaps = [_mk_snapshot_from_gapper(r) for r in raw]
-            # --- WIDENED FILTER --- Changed slice from [:50] to [:200]
-            gainers = sorted([s for s in snaps if s.pct is not None], key=lambda s: s.pct, reverse=True)[:200]
-            logging.info(f"Fetched {len(raw)} rows → {len(gainers)} top gainers found.")
+            gainers = sorted([s for s in snaps if s.pct is not None], key=lambda s: s.pct, reverse=True)[:2000]
 
+            reasons = defaultdict(int)
+            filtered = []
             for snap in gainers:
+                if snap.pct is None or snap.pct < SETTINGS.MIN_GAP_PERCENT:
+                    reasons["gap_below_threshold"] += 1
+                    continue
+                if getattr(snap, "volume", 0) and snap.volume < SETTINGS.MIN_PM_VOLUME:
+                    reasons["low_volume"] += 1
+                    continue
+                filtered.append(snap)
+
+            logging.info(f"Fetched ~{total_fetched} snapshots -> gainers={len(gainers)} kept={len(filtered)} "
+                         f"dropped={len(gainers)-len(filtered)} | reasons={dict(reasons)}")
+
+            for snap in filtered:
                 sym = snap.ticker
                 if (
                     sym not in POTENTIAL_GAPPERS
                     and sym not in TRADED_SYMBOLS_TODAY
-                    and snap.pct >= SETTINGS.MIN_GAP_PERCENT
                 ):
                     logging.info(f"Gapper {sym} at {snap.pct:.1f}% → adding to watchlist.")
                     POTENTIAL_GAPPERS[sym] = datetime.now(timezone.utc)
@@ -649,31 +667,34 @@ async def candidate_vetting_and_execution_task():
 
         async with API_SEMAPHORE:
             logging.info(f"--- VETTING (1st Wave) {symbol} FOR SHORT ---")
+            drop = defaultdict(int)
             try:
                 TRADED_SYMBOLS_TODAY.add(symbol)
+                snap_data = POTENTIAL_GAPPERS.get(f"{symbol}_data")
 
                 asset = await asyncio.to_thread(trading_client.get_asset, symbol)
                 if not asset.tradable:
-                    logging.info(f"FILTERED: {symbol} not tradable.")
-                    continue
+                    drop["not_tradable"] += 1; continue
 
                 if not asset.shortable or not asset.easy_to_borrow:
-                    logging.warning(f"FILTERED (1st Wave): {symbol} is not shortable. Adding to secondary watchlist.")
-                    snap_data = POTENTIAL_GAPPERS.get(f"{symbol}_data")
+                    drop["not_ETB"] += 1
                     price_to_store = snap_data.last if snap_data and snap_data.last is not None else 0.0
                     SECONDARY_WATCHLIST[symbol] = {'price': price_to_store, 'initial_gap': initial_gap_percent}
                     send_telegram_alert(f"➡️ `${symbol}` moved to 2nd Wave Watchlist (Gap: {initial_gap_percent:.1f}%)")
                     continue
 
-                if hasattr(asset, 'shares_outstanding') and asset.shares_outstanding is not None and asset.shares_outstanding > SETTINGS.MAX_SHARES_OUTSTANDING:
-                    logging.info(f"FILTERED: {symbol} shares outstanding ({asset.shares_outstanding}) exceeds max ({SETTINGS.MAX_SHARES_OUTSTANDING}).")
-                    continue
+                if hasattr(asset, 'shares_outstanding') and asset.shares_outstanding and \
+                   asset.shares_outstanding > SETTINGS.MAX_SHARES_OUTSTANDING:
+                    drop["too_many_shares_outstanding"] += 1; continue
 
                 quote = await get_last_quote_for_symbol(symbol)
                 entry_price = quote.bid_price
-                if not (entry_price > 0):
-                    logging.info(f"FILTERED: {symbol} has invalid quote.")
-                    continue
+                if not (entry_price and entry_price > 0):
+                    lp = getattr(snap_data, "last", None)
+                    if lp and lp > 0:
+                        entry_price = lp
+                    else:
+                        drop["invalid_quote"] += 1; continue
 
                 if len(OPEN_POSITIONS) < SETTINGS.MAX_POSITIONS and trading_enabled:
                     logging.info(f"✅ VETTING PASSED (1st Wave): Executing SHORT trade for {symbol}.")
@@ -681,6 +702,7 @@ async def candidate_vetting_and_execution_task():
             except Exception as e:
                 logging.error(f"Error during 1st Wave vetting for {symbol}: {e}", exc_info=True)
             finally:
+                if drop: logging.info(f"Vetting drop-off for {symbol}: {dict(drop)}")
                 TRADE_SIGNAL_QUEUE.task_done()
 
 async def execute_trade(symbol: str, side: OrderSide, price: float, initial_gap_percent: Optional[float] = None):
@@ -854,6 +876,9 @@ async def second_wave_revetting_task():
                         high_price = data['price']
 
                         snapshot = await get_snapshot_for_symbol(symbol)
+                        if not snapshot or not hasattr(snapshot, 'ticker'):
+                            logging.warning(f"Could not get valid snapshot for {symbol} during 2nd wave.")
+                            continue
                         current_gap = snapshot.ticker.todays_change_perc
 
                         if current_gap < initial_gap:
@@ -900,7 +925,6 @@ async def pyramid_positions_task():
             logging.info(f"Checking pyramid condition for {symbol} (Initial Gap: {initial_gap:.1f}%)")
             try:
                 snapshot = await get_snapshot_for_symbol(symbol)
-                # --- ROBUSTNESS FIX ---
                 if not snapshot or not hasattr(snapshot, 'ticker'):
                     logging.warning(f"Could not get valid snapshot for {symbol} during pyramid check.")
                     data['last_pyramid_check'] = now_utc
@@ -977,8 +1001,6 @@ async def sync_positions_on_startup():
             logging.info("No existing positions found in Alpaca account.")
             return
 
-        # --- STARTUP SYNC IMPROVEMENT ---
-        # Fetch open orders to link them to existing positions.
         open_orders = await asyncio.to_thread(trading_client.get_orders, GetOrdersRequest(status=QueryOrderStatus.OPEN))
         orders_by_symbol = {o.symbol: o for o in open_orders}
         logging.info(f"Found {len(open_orders)} open orders to sync.")
@@ -987,7 +1009,6 @@ async def sync_positions_on_startup():
         for pos in existing_positions:
             if pos.side == 'short':
                 stop_order_id = None
-                # Check if there's a matching open stop order for this position.
                 if pos.symbol in orders_by_symbol:
                     order = orders_by_symbol[pos.symbol]
                     if order.side == OrderSide.BUY and order.order_type == 'stop' and float(order.qty) == abs(float(pos.qty)):
@@ -1005,7 +1026,6 @@ async def sync_positions_on_startup():
                 if pos.symbol not in ANALYZED_SYMBOLS_TODAY:
                     try:
                         snapshot = await get_snapshot_for_symbol(pos.symbol)
-                        # --- ROBUSTNESS FIX ---
                         current_gap = 0.0
                         if snapshot and hasattr(snapshot, 'ticker'):
                             current_gap = snapshot.ticker.todays_change_perc
@@ -1025,7 +1045,7 @@ async def sync_positions_on_startup():
 async def main():
     """The main entry point for the bot."""
     check_environment_variables()
-    logging.info(f"--- Initializing Short_King.py v4.2 ---")
+    logging.info(f"--- Initializing Short_King.py v4.3 ---")
 
     try:
         account = await asyncio.to_thread(trading_client.get_account)
@@ -1036,11 +1056,17 @@ async def main():
 
     await sync_positions_on_startup()
 
-    send_telegram_alert(f"🤖 *Short King Bot Initializing...* Version 4.2. Now tracking {len(OPEN_POSITIONS)} existing positions.")
+    send_telegram_alert(f"🤖 *Short King Bot Initializing...* Version 4.3. Now tracking {len(OPEN_POSITIONS)} existing positions.")
 
-    if TELEGRAM_BOT_TOKEN:
+    TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "true").lower() in ("1","true","yes")
+    if TELEGRAM_ENABLED and TELEGRAM_BOT_TOKEN:
         app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
+        await app.initialize()
+        try:
+            await app.bot.delete_webhook(drop_pending_updates=True)
+        except Exception as _e:
+            logging.warning(f"delete_webhook warning: {_e}")
+        
         app.add_handler(CommandHandler("start", start_command))
         app.add_handler(CommandHandler("status", status_command))
         app.add_handler(CommandHandler("openpositions", positions_command))
@@ -1054,10 +1080,12 @@ async def main():
         app.add_handler(CommandHandler("set_max_positions", set_max_positions_command))
         app.add_handler(CommandHandler("toggle_pyramiding", toggle_pyramiding_command))
         app.add_handler(CommandHandler("market_status", market_status_command))
-
-        await app.initialize()
+        
         await app.start()
-        asyncio.create_task(app.updater.start_polling())
+        try:
+            asyncio.create_task(app.updater.start_polling(drop_pending_updates=True))
+        except Exception as e:
+            logging.error(f"Telegram polling failed: {e}. Disabling Telegram integration.")
 
     trading_stream.subscribe_trade_updates(handle_trade_updates)
 
