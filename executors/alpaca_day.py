@@ -1,18 +1,15 @@
 # ==============================================================================
-# --- AUTONOMOUS TRADING ALGORITHM (Short_King.py v4.3) ---
+# --- AUTONOMOUS TRADING ALGORITHM (Short_King.py v4.5) ---
 #
-# v4.3 UPDATE:
-# - FULL UNIVERSE SCAN: Now uses a paginated Polygon client to fetch all
-#   ~11k snapshots instead of a capped list, ensuring no gappers are missed.
-# - SCANNER STATS: Added detailed logging for how many tickers are filtered
-#   out during the initial gapper scan and for what reasons.
-# - VETTING OBSERVABILITY: Vetting logic now logs the specific reason why any
-#   given candidate is dropped, improving transparency.
-# - TELEGRAM ROBUSTNESS: Added a conflict guard to clear any existing webhooks
-#   on startup, preventing issues when restarting the bot.
+# v4.5 UPDATE:
+# - SHORTABLE-ONLY: Vetting logic now only requires the `shortable` flag,
+#   removing the `easy_to_borrow` check to allow trading HTB stocks.
+# - SPREAD FILTER ACTIVATED: The MAX_SPREAD_PERCENT setting is now actively
+#   used in the vetting process to discard stocks with wide bid-ask spreads.
 #
-# WARNING: THE AUTOMATIC END-OF-DAY POSITION CLOSING FEATURE HAS BEEN DISABLED.
-# POSITIONS WILL BE HELD OVERNIGHT UNLESS MANUALLY CLOSED.
+# v4.4 PATCH:
+# - TERMINOLOGY: Changed logging references from "ETB" (Easy-to-Borrow) to
+#   the more general "shortable" for clarity in vetting drop reasons.
 # ==============================================================================
 
 import asyncio
@@ -431,7 +428,7 @@ async def generate_openai_analysis(symbol: str, initial_gap_percent: Optional[fl
 # --- TELEGRAM BOT COMMANDS ---
 # ==============================================================================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = f"*Short_King.py v4.3* is running."
+    text = f"*Short_King.py v4.5* is running."
     await update.message.reply_text(text, parse_mode='Markdown')
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -627,9 +624,6 @@ async def consistency_and_vetting_task():
                 if symbol in TRADED_SYMBOLS_TODAY:
                     remove.append(symbol)
                     continue
-                
-                # if (now_utc - first_seen).total_seconds() < SETTINGS.GAPPER_CONSISTENCY_CHECK_SECONDS:
-                #     continue
 
                 snap = POTENTIAL_GAPPERS.get(f"{symbol}_data")
                 if not snap:
@@ -676,8 +670,8 @@ async def candidate_vetting_and_execution_task():
                 if not asset.tradable:
                     drop["not_tradable"] += 1; continue
 
-                if not asset.shortable or not asset.easy_to_borrow:
-                    drop["not_ETB"] += 1
+                if not asset.shortable:
+                    drop["not_shortable"] += 1
                     price_to_store = snap_data.last if snap_data and snap_data.last is not None else 0.0
                     SECONDARY_WATCHLIST[symbol] = {'price': price_to_store, 'initial_gap': initial_gap_percent}
                     send_telegram_alert(f"➡️ `${symbol}` moved to 2nd Wave Watchlist (Gap: {initial_gap_percent:.1f}%)")
@@ -688,6 +682,16 @@ async def candidate_vetting_and_execution_task():
                     drop["too_many_shares_outstanding"] += 1; continue
 
                 quote = await get_last_quote_for_symbol(symbol)
+                
+                ask = getattr(quote, "ask_price", None)
+                bid = getattr(quote, "bid_price", None)
+                if ask and bid and ask > 0 and bid > 0:
+                    mid = (ask + bid) / 2
+                    spread_pct = (ask - bid) / mid * 100
+                    if spread_pct > SETTINGS.MAX_SPREAD_PERCENT:
+                        drop["spread_too_wide"] += 1
+                        continue
+
                 entry_price = quote.bid_price
                 if not (entry_price and entry_price > 0):
                     lp = getattr(snap_data, "last", None)
@@ -887,7 +891,7 @@ async def second_wave_revetting_task():
 
                         asset = await asyncio.to_thread(trading_client.get_asset, symbol)
 
-                        if asset.shortable and asset.easy_to_borrow:
+                        if asset.shortable:
                             logging.info(f"✅ VETTING PASSED (2nd Wave): {symbol} is now shortable!")
 
                             price_to_use = high_price if high_price and high_price > 0 else snapshot.ticker.last_trade.price
@@ -1045,7 +1049,7 @@ async def sync_positions_on_startup():
 async def main():
     """The main entry point for the bot."""
     check_environment_variables()
-    logging.info(f"--- Initializing Short_King.py v4.3 ---")
+    logging.info(f"--- Initializing Short_King.py v4.5 ---")
 
     try:
         account = await asyncio.to_thread(trading_client.get_account)
@@ -1056,7 +1060,7 @@ async def main():
 
     await sync_positions_on_startup()
 
-    send_telegram_alert(f"🤖 *Short King Bot Initializing...* Version 4.3. Now tracking {len(OPEN_POSITIONS)} existing positions.")
+    send_telegram_alert(f"🤖 *Short King Bot Initializing...* Version 4.5. Now tracking {len(OPEN_POSITIONS)} existing positions.")
 
     TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "true").lower() in ("1","true","yes")
     if TELEGRAM_ENABLED and TELEGRAM_BOT_TOKEN:
