@@ -1,0 +1,7 @@
+{
+  "projectName": "RokAi",
+  "readmePath": "AGENTS.md",
+  "testCommand": "pytest -q",
+  "buildCommand": "make type && make lint && make test",
+  "deployNotes": "Render deploys from main via render.yaml. Do not touch secrets."
+}
