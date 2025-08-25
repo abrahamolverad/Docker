@@ -582,9 +582,7 @@ async def daily_research_and_selection():
             send_telegram("No swing candidates passed filters today.")
         else:
             summary = [f"{k} tgt {v['target']} ({v['time_weeks']}w) score ~{int(v['score_breakdown'].get('total',0))}" for k,v in list(CANDIDATES.items())[:10]]
-            send_telegram("📋 Candidates:
-"+"
-".join(summary))
+            send_telegram(f"📋 Candidates:\n{chr(10).join(summary)}")
     except Exception as e:
         jlog("research_error", run_id=run_id, err=str(e))
         send_telegram(f"Research error: {e}")
@@ -751,3 +749,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         send_telegram("⏹️ Bot stopped.")
+
