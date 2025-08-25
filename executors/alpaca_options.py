@@ -1,82 +1,111 @@
-# swing_investor_bot.py
-# Research-driven SWING bot: stocks-only execution, options-as-signal.
-# Live chat via Telegram; GPT-5 nano performs web search + writes thesis memos.
+# alpaca_options.py — FULL swing bot (stocks-only execution, options-as-signal)
+# ---------------------------------------------------------------------------
+# What’s inside (v2 — observability & Polygon options-first)
+# - Heavy, structured logging with decision traces (why each ticker was kept/filtered)
+# - Env toggles for DEBUG, dry-run, scan size, and entry style (market vs protected limit)
+# - Polygon V3 Options usage (nearest expiry, ATM call/put mids, expected move, OI/Skew)
+# - GPT is supportive (for catalyst memo), not a blocker for targets
+# - Immediate research on start + daily schedule; real entry window 09:35–09:55 ET
+# - ATR initial stop, trailing stop, time exit
+# - Telegram polling optional; raw HTTP send only (no 409 conflicts on Render)
+# - Uses your env names: ALPACA_UNHOLY_KEY/SECRET, Stocks_GPT_TELEGRAM_BOT_TOKEN
+# ---------------------------------------------------------------------------
 
-import os, sys, asyncio, logging, math, time, json
+import os
+import sys
+import json
+import time
+import math
+import uuid
+import asyncio
+import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, time as dtime, timezone
-from zoneinfo import ZoneInfo
-from typing import Dict, Any, List, Optional, Tuple
+from datetime import datetime, timedelta, time as dtime
+from typing import Any, Dict, List, Optional, Tuple
 
-from dotenv import load_dotenv
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # py<3.9 fallback
+    from backports.zoneinfo import ZoneInfo  # type: ignore
+
 import numpy as np
 import pandas as pd
+import requests
 from tenacity import retry, stop_after_attempt, wait_fixed
 
-# --- Vendors
+# ---- Vendors
 from openai import OpenAI
 from polygon import RESTClient as PolygonREST
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
-    MarketOrderRequest, LimitOrderRequest, StopOrderRequest, GetOrdersRequest, ClosePositionRequest
+    LimitOrderRequest,
+    MarketOrderRequest,
+    StopOrderRequest,
+    ClosePositionRequest,
 )
-from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
-from alpaca.common.exceptions import APIError
+from alpaca.trading.enums import OrderSide, TimeInForce
 
-# Telegram (bot commands)
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+# Telegram (commands are optional)
+try:
+    from telegram import Update
+    from telegram.ext import Application, CommandHandler, ContextTypes
+    TELEGRAM_IMPORTED = True
+except Exception:
+    TELEGRAM_IMPORTED = False
 
-# =========================
-# Settings
-# =========================
+# =============================================================================
+# Settings & ENV
+# =============================================================================
 @dataclass
 class Settings:
-    # Strategy horizon
-    HOLD_MIN_DAYS: int = 10
-    HOLD_MAX_DAYS: int = 60
-
-    # Universe & filters
+    # Universe filters
     MIN_PRICE: float = 2.0
     MAX_PRICE: float = 400.0
     MIN_AVG_DOLLAR_VOL: float = 2_000_000
-    MIN_MARKET_CAP: float = 100_000_000  # 100M
-    MAX_MARKET_CAP: float = 20_000_000_000  # 20B (focus on SMID)
+    MIN_MARKET_CAP: float = 100_000_000
+    MAX_MARKET_CAP: float = 20_000_000_000
     MAX_UNIVERSE: int = 400
+
+    # Holding horizon
+    HOLD_MIN_DAYS: int = 10
+    HOLD_MAX_DAYS: int = 60
 
     # Scoring weights
     W_FUND: float = 0.35
-    W_EVENT: float = 0.25
-    W_OPTIONS: float = 0.15
-    W_ATTENTION: float = 0.10
+    W_EVENT: float = 0.20
+    W_OPTIONS: float = 0.25   # ↑ emphasize options signals since you pay for it
+    W_ATTENTION: float = 0.05
     W_TECH: float = 0.15
 
-    # Entry threshold
-    MIN_SCORE: float = 70.0
+    MIN_SCORE: float = 60.0   # slightly relaxed
 
     # Risk
-    RISK_PER_TRADE_BP: int = 100         # 1.00% of equity per ATR
-    MAX_POSITION_PCT: float = 0.08       # 8% cap per name
-    SECTOR_CAP_PCT: float = 0.25         # 25% cap per sector (placeholder if you map sectors)
+    RISK_PER_TRADE_BP: int = 100  # 1% per ATR
+    MAX_POSITION_PCT: float = 0.08
     INIT_STOP_ATR_MULT: float = 1.25
     TRAIL_ATR_MULT_BEFORE_15: float = 1.5
     TRAIL_ATR_MULT_AFTER_15: float = 1.0
 
-    # Rebalance timing (ET)
-    DAILY_RESEARCH_ET: Tuple[int, int] = (16, 30)  # 4:30pm ET
-    ENTRY_WINDOW_ET: Tuple[int, int] = (9, 35)     # Enter a few minutes after open
+    # Schedules (ET)
+    DAILY_RESEARCH_ET: Tuple[int, int] = (16, 30)
+    ENTRY_WINDOW_ET: Tuple[int, int] = (9, 35)
+    ENTRY_WINDOW_ET_END: Tuple[int, int] = (9, 55)
 
-    # Concurrency
-    CONCURRENCY: int = 6
+    # Scanning
+    SCAN_LIMIT: int = int(os.getenv("SCAN_LIMIT", "200"))  # how many symbols to scan in detail
+
+    # Behavior toggles
+    PLACE_ORDERS: bool = os.getenv("PLACE_ORDERS", "true").lower() == "true"
+    ENTRY_STYLE: str = os.getenv("ENTRY_STYLE", "protected_limit")  # protected_limit|market
+    USE_POLYGON_OPTIONS: bool = os.getenv("USE_POLYGON_OPTIONS", "true").lower() == "true"
+    DRY_RUN: bool = os.getenv("DRY_RUN", "false").lower() == "true"  # log everything, skip orders
+    FORCE_TEST_SYMBOL: Optional[str] = os.getenv("FORCE_TEST_SYMBOL")  # e.g., AAPL to always include
+
 
 SETTINGS = Settings()
-
-# =========================
-# Env & Logging
-# =========================
-load_dotenv()
 ET = ZoneInfo("America/New_York")
 
+# Env
 ALPACA_KEY = os.getenv("ALPACA_UNHOLY_KEY")
 ALPACA_SECRET = os.getenv("ALPACA_UNHOLY_SECRET_KEY")
 ALPACA_IS_PAPER = os.getenv("ALPACA_PAPER_TRADING", "true").lower() == "true"
@@ -87,558 +116,635 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-nano")
 
 TELEGRAM_TOKEN = os.getenv("Stocks_GPT_TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_USER_ID")
+TELEGRAM_POLLING = os.getenv("TELEGRAM_POLLING", "false").lower() == "true"  # default false on Render
 
-if not all([ALPACA_KEY, ALPACA_SECRET, POLYGON_API_KEY, OPENAI_API_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
-    missing = [k for k,v in {
-        "ALPACA_UNHOLY_KEY":ALPACA_KEY, "ALPACA_UNHOLY_SECRET_KEY":ALPACA_SECRET,
-        "POLYGON_API_KEY":POLYGON_API_KEY, "OPENAI_API_KEY":OPENAI_API_KEY,
-        "Stocks_GPT_TELEGRAM_BOT_TOKEN":TELEGRAM_TOKEN, "TELEGRAM_USER_ID":TELEGRAM_CHAT_ID
-    }.items() if not v]
-    print(f"Missing env vars: {missing}")
-    sys.exit(1)
-
+# Logging config
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - [%(funcName)s] - %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler("swing_investor_bot.log", encoding="utf-8")]
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    handlers=[logging.StreamHandler(), logging.FileHandler("swing_investor_bot.log", encoding="utf-8")],
 )
 log = logging.getLogger("swingbot")
 
-# =========================
 # Clients
-# =========================
 alpaca = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=ALPACA_IS_PAPER)
 poly = PolygonREST(POLYGON_API_KEY)
 openai = OpenAI(api_key=OPENAI_API_KEY)
 
-# =========================
-# State
-# =========================
-PORTFOLIO: Dict[str, Dict[str, Any]] = {}      # symbol -> {qty, avg_price, stop_id, thesis, target, target_date, opened_at}
+# Global State
+PORTFOLIO: Dict[str, Dict[str, Any]] = {}
 WATCHLIST: List[str] = []
 CANDIDATES: Dict[str, Dict[str, Any]] = {}
 PAUSED: bool = False
 
-# =========================
-# Helpers
-# =========================
+# =============================================================================
+# Utility & Telemetry
+# =============================================================================
+
 def now_et() -> datetime:
     return datetime.now(ET)
 
-def is_between(now: datetime, hhmm_from: Tuple[int,int], hhmm_to: Tuple[int,int]) -> bool:
+
+def is_between(now: datetime, start: Tuple[int, int], end: Tuple[int, int]) -> bool:
     t = now.time()
-    start = dtime(*hhmm_from)
-    end = dtime(*hhmm_to)
-    return start <= t <= end
+    return dtime(*start) <= t <= dtime(*end)
+
 
 def send_telegram(msg: str):
+    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
+        return
     try:
-        import requests
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
         log.error(f"Telegram send failed: {e}")
 
-# =========================
-# Polygon fetchers
-# =========================
-def list_active_snapshots(limit=SETTINGS.MAX_UNIVERSE):
-    # Use list_snapshot_tickers (or fallback) to get liquid active names
+
+def jlog(event: str, **kwargs):
+    """Structured JSON log to make Render logs useful for step-by-step tracing."""
+    payload = {"event": event, "ts": now_et().isoformat(), **kwargs}
+    log.info(json.dumps(payload, default=str))
+
+
+# ---- HTTP helper for Polygon v3 endpoints (options)
+POLY_V3 = "https://api.polygon.io"
+
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
+def poly_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    p = params.copy() if params else {}
+    p["apiKey"] = POLYGON_API_KEY
+    url = POLY_V3 + path
+    t0 = time.time()
+    r = requests.get(url, params=p, timeout=8)
+    dt = int((time.time() - t0)*1000)
+    jlog("polygon_http", path=path, status=r.status_code, ms=dt, params={k:v for k,v in p.items() if k!='apiKey'})
+    r.raise_for_status()
+    return r.json()
+
+
+# =============================================================================
+# Polygon Data Fetchers
+# =============================================================================
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
+def list_active_snapshots(limit=400) -> List[str]:
     try:
-        snaps = poly.list_snapshot_tickers(market_type="stocks")
-    except AttributeError:
-        snaps = poly.get_snapshot_all_tickers()  # older client, still works
+        try:
+            snaps = poly.list_snapshot_tickers(market_type="stocks")
+        except AttributeError:
+            snaps = poly.get_snapshot_all_tickers()
+    except Exception as e:
+        log.error(f"snapshot fetch error: {e}")
+        return []
 
     rows = []
     for s in snaps:
         try:
             tkr = getattr(s, "ticker", None) or s.get("ticker")
-            last = getattr(getattr(s, "ticker", None), "last_trade", None)
-            price = getattr(last, "price", None)
-            v = getattr(getattr(s, "day", None), "v", None)
-            if not tkr or not price or not v: continue
+            day = getattr(s, "day", None)
+            v = getattr(day, "v", None)
+            last_trade = getattr(getattr(s, "ticker", None), "last_trade", None)
+            price = getattr(last_trade, "price", None)
+            if not tkr or not price or not v:
+                continue
             rows.append((tkr, float(price), int(v)))
         except Exception:
             continue
 
-    # Filter by price & approx dollar vol
-    df = pd.DataFrame(rows, columns=["symbol","price","vol"])
-    df["dollar_vol"] = df["price"]*df["vol"]
-    df = df[(df["price"].between(SETTINGS.MIN_PRICE, SETTINGS.MAX_PRICE)) &
-            (df["dollar_vol"] >= SETTINGS.MIN_AVG_DOLLAR_VOL)]
+    if not rows:
+        return []
+    df = pd.DataFrame(rows, columns=["symbol", "price", "vol"])  # type: ignore
+    df["dollar_vol"] = df["price"] * df["vol"]
+    df = df[(df["price"].between(SETTINGS.MIN_PRICE, SETTINGS.MAX_PRICE)) & (df["dollar_vol"] >= SETTINGS.MIN_AVG_DOLLAR_VOL)]
     df = df.sort_values("dollar_vol", ascending=False).head(limit)
     return df["symbol"].tolist()
 
-def get_aggs(ticker: str, timespan="day", window=60) -> pd.DataFrame:
+
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
+def get_aggs(ticker: str, timespan="day", window=90) -> pd.DataFrame:
     end = now_et().date()
     start = end - timedelta(days=365)
-    aggs = poly.get_aggs(ticker, 1, timespan, str(start), str(end))
-    if not aggs: return pd.DataFrame([])
-    df = pd.DataFrame([{"t":a.timestamp, "o":a.open, "h":a.high, "l":a.low, "c":a.close, "v":a.volume} for a in aggs])
-    df = df.tail(window)
-    return df
+    try:
+        aggs = poly.get_aggs(ticker, 1, timespan, str(start), str(end))
+    except Exception as e:
+        jlog("get_aggs_error", ticker=ticker, err=str(e))
+        return pd.DataFrame([])
+    if not aggs:
+        return pd.DataFrame([])
+    df = pd.DataFrame([{ "t": a.timestamp, "o": a.open, "h": a.high, "l": a.low, "c": a.close, "v": a.volume } for a in aggs ])
+    return df.tail(window)
+
 
 def atr(df: pd.DataFrame, period=14) -> Optional[float]:
-    if df.empty or len(df) < period+1: return None
-    high, low, close = df["h"].values, df["l"].values, df["c"].values
-    tr = np.maximum(high[1:] - low[1:], np.maximum(abs(high[1:] - close[:-1]), abs(low[1:] - close[:-1])))
+    if df.empty or len(df) < period + 1:
+        return None
+    h, l, c = df["h"].values, df["l"].values, df["c"].values
+    tr = np.maximum(h[1:] - l[1:], np.maximum(np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])))
     return float(pd.Series(tr).rolling(period).mean().dropna().iloc[-1])
 
-def momentum_20d(df: pd.DataFrame) -> Optional[float]:
-    if df.empty or len(df) < 20: return None
-    return (df["c"].iloc[-1]/df["c"].iloc[-20] - 1.0) * 100.0
 
-def get_fundamentals_snapshot(ticker:str) -> Dict[str,Any]:
-    out = {"rev_yoy":None, "eps_yoy":None, "margin_delta":None, "mcap":None}
+def momentum_20d(df: pd.DataFrame) -> Optional[float]:
+    if df.empty or len(df) < 20:
+        return None
+    return float((df["c"].iloc[-1] / df["c"].iloc[-20] - 1.0) * 100.0)
+
+
+def get_fundamentals_snapshot(ticker: str) -> Dict[str, Any]:
+    out = {"rev_yoy": None, "eps_yoy": None, "margin_delta": None, "mcap": None}
     try:
-        # Polygon has multiple fundamentals endpoints; we use vX/reference/financials via client shortcut
-        # (python client exposes as REST paths; keeping it light and robust)
         fin = poly.get_financials(ticker=ticker, limit=4)
-        if not fin: return out
-        rows = []
-        for f in fin:
-            rows.append({
-                "period": getattr(f, "fiscal_period", None) or getattr(f, "period", None),
-                "rev": float(getattr(getattr(f, "income_statement", None) or (), "revenues", 0) or 0),
-                "eps": float(getattr(getattr(f, "income_statement", None) or (), "eps_basic", 0) or 0),
-                "gm":  float(getattr(getattr(f, "income_statement", None) or (), "gross_profit", 0) or 0),
-                "rev_cost": float(getattr(getattr(f,"income_statement", None) or (), "cost_of_revenue", 0) or 0)
-            })
-        if len(rows)>=2:
-            rev_yoy = (rows[0]["rev"] - rows[1]["rev"])/abs(rows[1]["rev"]) if rows[1]["rev"] else None
-            eps_yoy = (rows[0]["eps"] - rows[1]["eps"])/abs(rows[1]["eps"]) if rows[1]["eps"] else None
-            gm0 = rows[0]["gm"]; rc0 = rows[0]["rev_cost"]; gm1 = rows[1]["gm"]; rc1 = rows[1]["rev_cost"]
-            margin_delta = ((gm0 - rc0) - (gm1 - rc1)) if all(x is not None for x in [gm0,rc0,gm1,rc1]) else None
-            out.update({"rev_yoy": rev_yoy*100 if rev_yoy is not None else None,
-                        "eps_yoy": eps_yoy*100 if eps_yoy is not None else None,
-                        "margin_delta": margin_delta})
-        # Market cap via snapshot (approx)
+        if fin:
+            rows = []
+            for f in fin:
+                inc = getattr(f, "income_statement", None) or {}
+                rows.append({
+                    "rev": float(getattr(inc, "revenues", 0) or 0),
+                    "eps": float(getattr(inc, "eps_basic", 0) or 0),
+                    "gp": float(getattr(inc, "gross_profit", 0) or 0),
+                    "cor": float(getattr(inc, "cost_of_revenue", 0) or 0),
+                })
+            if len(rows) >= 2:
+                r0, r1 = rows[0]["rev"], rows[1]["rev"]
+                e0, e1 = rows[0]["eps"], rows[1]["eps"]
+                rev_y = ((r0 - r1) / abs(r1)) * 100 if r1 else None
+                eps_y = ((e0 - e1) / abs(e1)) * 100 if e1 else None
+                md = (rows[0]["gp"] - rows[0]["cor"]) - (rows[1]["gp"] - rows[1]["cor"]) if all(x is not None for x in [rows[0]["gp"], rows[0]["cor"], rows[1]["gp"], rows[1]["cor"]]) else None
+                out.update({"rev_yoy": rev_y, "eps_yoy": eps_y, "margin_delta": md})
         snap = poly.get_snapshot_ticker(ticker=ticker, market_type="stocks")
         out["mcap"] = getattr(getattr(snap, "ticker", None), "market_cap", None)
     except Exception as e:
-        log.debug(f"fundamentals fail {ticker}: {e}")
+        jlog("fundamentals_error", ticker=ticker, err=str(e))
     return out
 
-def get_options_signals(ticker:str) -> Dict[str,Any]:
-    """Compute a minimal options signal set: IV percentile, call/put OI concentration, expected move."""
-    out = {"iv_pct":None, "oi_spike":None, "exp_move_pct":None, "skew_call_over_put":None}
+
+# ---- Options enrichment using Polygon v3 (contracts + quotes/snapshots)
+def get_options_signals(ticker: str) -> Dict[str, Any]:
+    out = {"iv_pct": None, "oi_total": None, "exp_move_pct": None, "skew_call_over_put": None,
+           "atm_strike": None, "expiry": None, "call_id": None, "put_id": None}
     try:
-        # nearest monthly expiry chain
-        # polygon client: get_options_contracts, get_option_chain, get_snapshot_option...
-        # To keep robust across client versions, call REST path via requests if needed; here we use the client’s convenience:
-        chains = poly.get_option_chain(underlying_symbol=ticker, expires="next")  # pseudo helper; some clients expose similar
-        if not chains: return out
-        # Filter ATM strikes
-        spot = getattr(getattr(poly.get_snapshot_ticker(ticker=ticker, market_type="stocks"), "ticker", None), "last_trade", None)
-        spot = float(getattr(spot, "price", None) or 0)
-        if spot <= 0: return out
-        # Find closest strike
-        strikes = sorted({float(getattr(c, "strike_price", 0) or 0) for c in chains if hasattr(c, "strike_price")})
-        if not strikes: return out
-        strike = min(strikes, key=lambda k: abs(k-spot))
-        calls = [c for c in chains if getattr(c,"contract_type", "").upper()=="CALL" and abs(float(getattr(c,"strike_price",0))-strike)<1e-6]
-        puts  = [p for p in chains if getattr(p,"contract_type","").upper()=="PUT" and abs(float(getattr(p,"strike_price",0))-strike)<1e-6]
-        def mid(x): 
-            a = float(getattr(x,"ask_price",0) or 0); b=float(getattr(x,"bid_price",0) or 0); 
-            return (a+b)/2 if a and b else None
-        call_mid = max([mid(c) for c in calls if mid(c)], default=None)
-        put_mid  = max([mid(p) for p in puts if mid(p)], default=None)
+        # Spot
+        snap = poly.get_snapshot_ticker(ticker=ticker, market_type="stocks")
+        spot_obj = getattr(getattr(snap, "ticker", None), "last_trade", None)
+        spot = float(getattr(spot_obj, "price", 0.0) or 0.0)
+        if not spot:
+            return out
+
+        if not SETTINGS.USE_POLYGON_OPTIONS:
+            return out
+
+        # 1) Find nearest expiry via reference contracts
+        today = now_et().date().isoformat()
+        j = poly_get("/v3/reference/options/contracts", {
+            "underlying_ticker": ticker,
+            "limit": 500,
+            "expiration_date.gte": today,
+            "order": "asc",
+            "sort": "expiration_date",
+        })
+        results = j.get("results", [])
+        if not results:
+            return out
+        expiries = []
+        for r in results:
+            exp = r.get("expiration_date")
+            if exp and exp not in expiries:
+                expiries.append(exp)
+        expiry = expiries[0]
+        out["expiry"] = expiry
+        # 2) Pick ATM strike (closest to spot) among this expiry
+        same_exp = [r for r in results if r.get("expiration_date") == expiry]
+        strikes = sorted({float(r.get("strike_price")) for r in same_exp if r.get("strike_price") is not None})
+        if not strikes:
+            return out
+        atm = min(strikes, key=lambda k: abs(k - spot))
+        out["atm_strike"] = atm
+        atm_calls = [r for r in same_exp if r.get("contract_type") == "call" and abs(float(r.get("strike_price", 0)) - atm) < 1e-9]
+        atm_puts  = [r for r in same_exp if r.get("contract_type") == "put"  and abs(float(r.get("strike_price", 0)) - atm) < 1e-9]
+        if not atm_calls or not atm_puts:
+            return out
+        call_id = atm_calls[0].get("contract_id")
+        put_id  = atm_puts[0].get("contract_id")
+        out.update({"call_id": call_id, "put_id": put_id})
+
+        # 3) Get quotes (mid as proxy) — try quotes endpoint, fallback to snapshot
+        def mid_from_quote(q: Dict[str, Any]) -> Optional[float]:
+            a = q.get("ask_price") or q.get("P") or q.get("ask")
+            b = q.get("bid_price") or q.get("p") or q.get("bid")
+            if a and b:
+                try:
+                    return (float(a) + float(b)) / 2.0
+                except Exception:
+                    return None
+            return None
+
+        call_mid = None; put_mid = None; total_oi = None; skew = None
+        try:
+            qc = poly_get(f"/v3/quotes/options/{call_id}/last")
+            qp = poly_get(f"/v3/quotes/options/{put_id}/last")
+            call_mid = mid_from_quote(qc.get("results", {}) or {})
+            put_mid  = mid_from_quote(qp.get("results", {}) or {})
+        except Exception as e:
+            jlog("options_quotes_error", ticker=ticker, err=str(e))
+            # fallback to snapshots
+            sc = poly_get(f"/v3/snapshot/options/{ticker}/{call_id}")
+            sp = poly_get(f"/v3/snapshot/options/{ticker}/{put_id}")
+            call_mid = mid_from_quote((sc.get("results", {}) or {}).get("latest_quote", {}))
+            put_mid  = mid_from_quote((sp.get("results", {}) or {}).get("latest_quote", {}))
+        # Open interest if present on metadata
+        try:
+            # some contracts return oi on reference or snapshot
+            oi_c = atm_calls[0].get("open_interest")
+            oi_p = atm_puts[0].get("open_interest")
+            if oi_c is None or oi_p is None:
+                sc2 = poly_get(f"/v3/snapshot/options/{ticker}/{call_id}")
+                sp2 = poly_get(f"/v3/snapshot/options/{ticker}/{put_id}")
+                oi_c = oi_c or ((sc2.get("results", {}) or {}).get("open_interest"))
+                oi_p = oi_p or ((sp2.get("results", {}) or {}).get("open_interest"))
+            if oi_c is not None and oi_p is not None:
+                total_oi = float(oi_c) + float(oi_p)
+                skew = round(float(oi_c) / (float(oi_p) + 1e-6), 2)
+        except Exception:
+            pass
+
         if call_mid and put_mid and spot:
-            exp_move = (call_mid + put_mid) / spot
-            out["exp_move_pct"] = round(exp_move*100, 2)
-        # OI spikes & skew
-        call_oi = sum([float(getattr(c,"open_interest",0) or 0) for c in calls])
-        put_oi  = sum([float(getattr(p,"open_interest",0) or 0) for p in puts])
-        out["skew_call_over_put"] = round(call_oi/(put_oi+1e-6), 2)
-        # IV percentile (rough): compare current ATM IV to 1Y range from snapshots
-        ivs = [float(getattr(c,"implied_volatility",0) or 0) for c in chains if getattr(c,"contract_type","").upper()=="CALL"]
-        if ivs:
-            cur_iv = np.nanmedian(ivs)
-            # Pull historical daily IV proxies via options snapshots (simplified). If unavailable, approximate with 30d realized vol.
-            hist = get_aggs(ticker, "day", 252)
-            if not hist.empty:
-                rv = hist["c"].pct_change().rolling(30).std().dropna()*np.sqrt(252)
-                if len(rv)>20:
-                    iv_pct = float((rv <= cur_iv).mean()*100)
-                    out["iv_pct"] = round(iv_pct, 1)
-        # OI spike heuristic
-        out["oi_spike"] = True if (call_oi + put_oi) > 10_000 else False
+            out["exp_move_pct"] = round(((call_mid + put_mid) / spot) * 100.0, 2)
+        out["oi_total"] = total_oi
+        out["skew_call_over_put"] = skew
+        # IV percentile proxy via realized vol (fallback)
+        hist = get_aggs(ticker, "day", 252)
+        if not hist.empty:
+            rv = hist["c"].pct_change().rolling(30).std().dropna() * math.sqrt(252)
+            if len(rv) > 20:
+                cur = rv.iloc[-1]
+                iv_pct = float((rv <= cur).mean() * 100)
+                out["iv_pct"] = round(iv_pct, 1)
+        jlog("options_enriched", ticker=ticker, **{k:v for k,v in out.items() if v is not None})
     except Exception as e:
-        log.debug(f"options signal fail {ticker}: {e}")
+        jlog("options_enrich_error", ticker=ticker, err=str(e))
     return out
 
-# =========================
-# GPT Research
-# =========================
-def gpt_web_research_memo(ticker:str, facts:Dict[str,Any]) -> Dict[str,Any]:
-    """Ask GPT-5 to browse and produce a thesis memo with target/stop/time."""
-    user_prompt = f"""
-You are an equity analyst for 2–12 week swing trades.
-Ticker: {ticker}
 
-[Bot facts]
-Price: {facts.get('price')}
-ATR(14d): {facts.get('atr')}
-20d Momentum %: {facts.get('mom20')}
-Fundamentals: rev_yoy={facts.get('rev_yoy')}%, eps_yoy={facts.get('eps_yoy')}%, margin_delta={facts.get('margin_delta')}, mcap={facts.get('mcap')}
-Options signals: iv_pct={facts.get('iv_pct')}, exp_move%={facts.get('exp_move_pct')}, skew_call_over_put={facts.get('skew_call_over_put')}, oi_spike={facts.get('oi_spike')}
+# =============================================================================
+# GPT (supportive, non-blocking)
+# =============================================================================
 
-Your tasks:
-1) Use web search to find the **most recent catalysts** (IR press releases, SEC/EDGAR, reputable news) and **summarize** them with links.
-2) Assess Reddit/X chatter at a high level (signals/key narratives) with links if notable.
-3) Provide a **swing thesis memo** with: Bull case, Bear case, Why now, Risks.
-4) Output **Target Price**, **Time Window** (weeks), **Initial Stop** (structure-based), and **Confidence 0–100**.
-Return a compact JSON with keys: thesis, target_price, time_weeks, stop_note, confidence, links[].
+def gpt_web_research_memo(ticker: str, facts: Dict[str, Any]) -> Dict[str, Any]:
+    prompt = f"""
+Be a concise sell-side analyst for 2–12 week swing trades. Ticker: {ticker}
+Summarize fresh catalysts (IR/EDGAR/news), narratives on Reddit/X, and return JSON only:
+{{"thesis":"...","links":["..."],"confidence":55}}
+Facts: {json.dumps(facts)[:1500]}
 """
     try:
-        # Prefer Responses API with web_search tool
-        resp = openai.responses.create(
+        resp = openai.chat.completions.create(
             model=OPENAI_MODEL,
-            input=user_prompt,
-            tools=[{"type":"web_search"}],
+            messages=[{"role": "system", "content": "Return compact JSON only."},{"role":"user","content":prompt}],
+            temperature=0.2,
         )
-        content = resp.output_text  # the model should emit JSON or text with JSON
-    except Exception:
-        # Fallback to chat completion (no browsing)
-        comp = openai.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[{"role":"system","content":"Return concise JSON only."},
-                      {"role":"user","content":user_prompt}],
-            temperature=0.2
-        )
-        content = comp.choices[0].message.content
+        txt = resp.choices[0].message.content or "{}"
+        data = json.loads(txt)
+        return {"thesis": data.get("thesis"), "links": data.get("links", []), "confidence": int(data.get("confidence", 55))}
+    except Exception as e:
+        jlog("gpt_memo_error", ticker=ticker, err=str(e))
+        return {"thesis": None, "links": [], "confidence": 55}
 
-    # Safe JSON parse
-    try:
-        data = json.loads(content)
-    except Exception:
-        data = {"thesis": content[:2000], "target_price": None, "time_weeks": 6, "stop_note":"VWAP/ATR stop", "confidence": 55, "links":[]}
-    return data
 
-# =========================
-# Scoring
-# =========================
-def score_candidate(f, opt, mom20):
-    s_fund = 0
+# =============================================================================
+# Scoring & Risk
+# =============================================================================
+
+def score_breakdown(f: Dict[str, Any], opt: Dict[str, Any], mom20: Optional[float]) -> Dict[str,float]:
+    s_fund = 0.0
     if f.get("rev_yoy") is not None: s_fund += np.clip(f["rev_yoy"]/20, -1, 1)*50
     if f.get("eps_yoy") is not None: s_fund += np.clip(f["eps_yoy"]/20, -1, 1)*50
-    # margin delta just adds small bonus if positive
     if f.get("margin_delta") and f["margin_delta"]>0: s_fund += 5
-    s_fund = np.clip(s_fund, 0, 100)
+    s_fund = float(np.clip(s_fund, 0, 100))
 
-    s_event = 50  # neutral baseline, GPT will tilt up/down post-memo
-    s_opt = 0
-    if opt.get("iv_pct") is not None:
-        s_opt += (opt["iv_pct"]-50)/50*40  # >50th pct → positive attention
-    if opt.get("oi_spike"): s_opt += 10
+    s_event = 50.0  # neutral; memo nudges via confidence later
+
+    s_opt = 0.0
+    if opt.get("iv_pct") is not None: s_opt += (opt["iv_pct"]-50)/50*40
+    if opt.get("oi_total") and opt["oi_total"]>10_000: s_opt += 10
     if opt.get("skew_call_over_put") and opt["skew_call_over_put"]>1.25: s_opt += 10
+    if opt.get("exp_move_pct") and opt["exp_move_pct"]>4: s_opt += min(10, (opt["exp_move_pct"]-4))
     s_opt = float(np.clip(s_opt, 0, 100))
 
-    s_attn = 50  # placeholder; GPT research may adjust decision
-    s_tech = 0
+    s_attn = 50.0
+
+    s_tech = 0.0
     if mom20 is not None: s_tech += np.clip(mom20/20, -1, 1)*60
     s_tech = float(np.clip(s_tech, 0, 100))
 
-    total = (SETTINGS.W_FUND*s_fund + SETTINGS.W_EVENT*s_event +
-             SETTINGS.W_OPTIONS*s_opt + SETTINGS.W_ATTENTION*s_attn +
-             SETTINGS.W_TECH*s_tech)*100  # weights sum to 1.0
-    return float(np.clip(total, 0, 100))
+    total = (Settings.W_FUND*s_fund + Settings.W_EVENT*s_event + Settings.W_OPTIONS*s_opt + Settings.W_ATTENTION*s_attn + Settings.W_TECH*s_tech)*100
+    return {"fund":s_fund,"event":s_event,"opt":s_opt,"attn":s_attn,"tech":s_tech,"total":float(np.clip(total,0,100))}
 
-# =========================
-# Risk & Execution
-# =========================
-def position_size_from_atr(portfolio_equity: float, atr_val: float, price: float) -> int:
-    if not atr_val or atr_val<=0 or price<=0: return 0
-    per_name_risk = (SETTINGS.RISK_PER_TRADE_BP/10000.0) * portfolio_equity
-    shares = int(per_name_risk / atr_val)
-    # cap by max position %
-    max_shares_by_limit = int((SETTINGS.MAX_POSITION_PCT*portfolio_equity)/price)
-    return max(0, min(shares, max_shares_by_limit))
 
-def compute_initial_stop(entry: float, avwap: Optional[float], atr_val: float) -> float:
-    base = entry - SETTINGS.INIT_STOP_ATR_MULT*atr_val
-    if avwap: base = min(base, avwap - 0.25*atr_val)
-    return round(max(0.01, base), 2)
+def position_size_from_atr(equity: float, atr_val: float, price: float) -> int:
+    if not atr_val or atr_val <= 0 or price <= 0:
+        return 0
+    per_name_risk = (Settings.RISK_PER_TRADE_BP/10000.0)*equity
+    shares = int(per_name_risk/max(1e-6, atr_val))
+    cap_shares = int((Settings.MAX_POSITION_PCT*equity)/price)
+    return max(0, min(shares, cap_shares))
+
+
+def compute_initial_stop(entry: float, atr_val: float) -> float:
+    return round(max(0.01, entry - Settings.INIT_STOP_ATR_MULT*atr_val), 2)
+
 
 def compute_trailing_stop(highest_close: float, atr_val: float, profit_ratio: float) -> float:
-    mult = SETTINGS.TRAIL_ATR_MULT_AFTER_15 if profit_ratio>=0.15 else SETTINGS.TRAIL_ATR_MULT_BEFORE_15
+    mult = Settings.TRAIL_ATR_MULT_AFTER_15 if profit_ratio>=0.15 else Settings.TRAIL_ATR_MULT_BEFORE_15
     return round(highest_close - mult*atr_val, 2)
 
+
 def account_equity() -> float:
-    acct = alpaca.get_account()
-    return float(acct.equity)
-
-def place_entry_order(symbol:str, qty:int, limit_price:float):
-    od = LimitOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY,
-                           limit_price=limit_price, time_in_force=TimeInForce.DAY, extended_hours=False)
-    return alpaca.submit_order(order_data=od)
-
-def place_stop_order(symbol:str, qty:int, stop_price:float):
-    od = StopOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL,
-                          stop_price=stop_price, time_in_force=TimeInForce.GTC)
-    return alpaca.submit_order(order_data=od)
-
-def close_position_percent(symbol:str, pct:float=1.0):
-    req = ClosePositionRequest(symbol_or_asset_id=symbol, percentage=str(pct))
-    return alpaca.close_position(close=req)
-
-# =========================
-# Research + Selection + Entry
-# =========================
-async def daily_research_and_selection():
-    """Run after close: form watchlist, ask GPT to write memos, stash targets, schedule entries."""
-    global WATCHLIST, CANDIDATES
     try:
-        send_telegram("🧠 Running daily research…")
+        acct = alpaca.get_account()
+        return float(acct.equity)
+    except Exception as e:
+        jlog("equity_error", err=str(e))
+        return 0.0
+
+
+def place_entry(symbol: str, qty: int, ref_price: float) -> Optional[str]:
+    if SETTINGS.DRY_RUN or not SETTINGS.PLACE_ORDERS:
+        jlog("order_skipped", symbol=symbol, qty=qty, reason="DRY_RUN or PLACE_ORDERS=false")
+        return "DRY_RUN"
+    try:
+        if SETTINGS.ENTRY_STYLE == "market":
+            od = MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
+        else:
+            limit_price = round(ref_price*1.003, 2)
+            od = LimitOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, limit_price=limit_price, time_in_force=TimeInForce.DAY, extended_hours=False)
+        odr = alpaca.submit_order(order_data=od)
+        return getattr(odr, "id", None) or "OK"
+    except Exception as e:
+        jlog("order_error", symbol=symbol, err=str(e))
+        return None
+
+
+def place_stop(symbol: str, qty: int, stop_price: float) -> Optional[str]:
+    if SETTINGS.DRY_RUN or not SETTINGS.PLACE_ORDERS:
+        return "DRY_RUN"
+    try:
+        od = StopOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, stop_price=stop_price, time_in_force=TimeInForce.GTC)
+        s = alpaca.submit_order(order_data=od)
+        return getattr(s, "id", None) or "OK"
+    except Exception as e:
+        jlog("stop_error", symbol=symbol, err=str(e))
+        return None
+
+
+# =============================================================================
+# Research + Selection
+# =============================================================================
+async def daily_research_and_selection():
+    global WATCHLIST, CANDIDATES
+    run_id = str(uuid.uuid4())[:8]
+    jlog("research_start", run_id=run_id)
+    try:
         universe = list_active_snapshots()
-        WATCHLIST = universe[:SETTINGS.MAX_UNIVERSE]
+        if not universe:
+            universe = ["AAPL","MSFT","NVDA","TSLA","META","AMZN","AMD","GOOGL","NFLX","CRM"]
+            jlog("universe_fallback", run_id=run_id, size=len(universe))
+        WATCHLIST = universe[:Settings.MAX_UNIVERSE]
+        jlog("watchlist_ready", run_id=run_id, size=len(WATCHLIST))
 
-        picked: Dict[str, Dict[str,Any]] = {}
-        for sym in WATCHLIST[:60]:  # keep first pass tight for speed
+        picked: Dict[str, Dict[str, Any]] = {}
+        scanned = 0
+        reject_counts = {"nodata":0,"mom":0,"mcap":0,"score":0,"target":0}
+
+        for sym in WATCHLIST[:SETTINGS.SCAN_LIMIT]:
+            scanned += 1
             df = get_aggs(sym, "day", 90)
-            if df.empty: continue
-            mom20 = momentum_20d(df)
-            if mom20 is None or mom20 < -10:  # avoid near-term downtrends
+            if df.empty:
+                reject_counts["nodata"] += 1
+                jlog("rej_nodata", run_id=run_id, sym=sym)
                 continue
-
+            mom20 = momentum_20d(df)
+            if mom20 is None or mom20 < -5:
+                reject_counts["mom"] += 1
+                jlog("rej_mom", run_id=run_id, sym=sym, mom20=mom20)
+                continue
             a = atr(df, 14)
             price = float(df["c"].iloc[-1])
-
             f = get_fundamentals_snapshot(sym)
-            if f.get("mcap") and not (SETTINGS.MIN_MARKET_CAP <= f["mcap"] <= SETTINGS.MAX_MARKET_CAP):
+            if f.get("mcap") and not (Settings.MIN_MARKET_CAP <= f["mcap"] <= Settings.MAX_MARKET_CAP):
+                reject_counts["mcap"] += 1
+                jlog("rej_mcap", run_id=run_id, sym=sym, mcap=f.get("mcap"))
                 continue
-
             opt = get_options_signals(sym)
-            base_score = score_candidate(f, opt, mom20)
-            if base_score < SETTINGS.MIN_SCORE:
+            sb = score_breakdown(f, opt, mom20)
+            total = sb["total"]
+            if total < Settings.MIN_SCORE:
+                reject_counts["score"] += 1
+                jlog("rej_score", run_id=run_id, sym=sym, score=total, breakdown=sb)
                 continue
 
-            facts = {"price":price, "atr":a, "mom20":mom20, **f, **opt}
-            memo = gpt_web_research_memo(sym, facts)
-            # Light post-filter: require a target higher than price
-            tpx = memo.get("target_price")
-            target_ok = False
+            # Target & time (non-blocking): use options exp. move or 2*ATR as fallback
+            exp_move = opt.get("exp_move_pct") or 6.0
+            tgt_default = round(price * (1 + max(0.08, exp_move*0.6/100)), 2)
+            memo = gpt_web_research_memo(sym, {"price":price,"atr":a,"mom20":mom20,**f,**{k:v for k,v in opt.items() if v is not None}})
+            target = None
             try:
-                if tpx: target_ok = float(tpx) > price*1.05
-            except Exception: pass
-            if not target_ok: 
-                continue
+                # if your GPT memo returns a numeric target, prefer it; else default
+                target = float(memo.get("target_price"))  # may not exist
+            except Exception:
+                target = None
+            if not target or target <= price*1.03:
+                target = tgt_default
+            time_weeks = int(memo.get("time_weeks", 8)) if isinstance(memo, dict) else 8
 
             picked[sym] = {
-                "price":price, "atr":a, "facts":facts, "memo":memo,
-                "target": float(memo.get("target_price") or 0),
-                "time_weeks": int(memo.get("time_weeks") or 8),
-                "confidence": int(memo.get("confidence") or 55)
+                "price": price,
+                "atr": a or 1.0,
+                "facts": {"mom20":mom20, **f, **opt},
+                "target": target,
+                "time_weeks": time_weeks,
+                "confidence": int(memo.get("confidence", 55)) if isinstance(memo, dict) else 55,
+                "score_breakdown": sb,
             }
+            jlog("kept", run_id=run_id, sym=sym, price=price, atr=a, exp_move=opt.get("exp_move_pct"), target=target, score=total, sb=sb)
+
+        if SETTINGS.FORCE_TEST_SYMBOL and SETTINGS.FORCE_TEST_SYMBOL not in picked:
+            sym = SETTINGS.FORCE_TEST_SYMBOL
+            df = get_aggs(sym, "day", 90)
+            if not df.empty:
+                a = atr(df,14) or 1.0
+                price = float(df["c"].iloc[-1])
+                picked[sym] = {"price":price, "atr":a, "facts":{}, "target": round(price*1.08,2), "time_weeks":6, "confidence":80, "score_breakdown":{}}
+                jlog("force_added", run_id=run_id, sym=sym)
 
         CANDIDATES = picked
+        jlog("research_done", run_id=run_id, scanned=scanned, kept=len(CANDIDATES), rejects=reject_counts)
         if not CANDIDATES:
             send_telegram("No swing candidates passed filters today.")
         else:
-            lines = [f"*{k}* → tgt ${v['target']:.2f} in ~{v['time_weeks']}w (conf {v['confidence']}), ATR {v['facts']['atr']:.2f}" for k,v in CANDIDATES.items()]
-            send_telegram("📋 *Candidates:*\n" + "\n".join(lines[:15]))
+            summary = [f"{k} tgt {v['target']} ({v['time_weeks']}w) score ~{int(v['score_breakdown'].get('total',0))}" for k,v in list(CANDIDATES.items())[:10]]
+            send_telegram("📋 Candidates:
+"+"
+".join(summary))
     except Exception as e:
-        log.error(f"daily_research_and_selection failed: {e}", exc_info=True)
+        jlog("research_error", run_id=run_id, err=str(e))
         send_telegram(f"Research error: {e}")
 
+
+# =============================================================================
+# Entry & Monitoring
+# =============================================================================
 async def entry_window_task():
-    """Enter top candidates near the open with sizing and initial stops."""
     await asyncio.sleep(1)
     while True:
         n = now_et()
-        if n.weekday() >= 5:  # weekend
+        if n.weekday() >= 5:
             await asyncio.sleep(300); continue
-
-        if is_between(n, SETTINGS.ENTRY_WINDOW_ET, SETTINGS.ENTRY_WINDOW_ET):
+        if is_between(n, Settings.ENTRY_WINDOW_ET, Settings.ENTRY_WINDOW_ET_END):
             if PAUSED or not CANDIDATES:
-                await asyncio.sleep(60); continue
-            # choose top 3 by confidence then target/atr reward
-            ranked = sorted(CANDIDATES.items(), key=lambda kv:(kv[1]["confidence"], kv[1]["target"]/max(1e-6, kv[1]["facts"]["atr"])), reverse=True)[:3]
+                await asyncio.sleep(30); continue
+            ranked = sorted(CANDIDATES.items(), key=lambda kv: (kv[1]["confidence"], kv[1]["target"]/max(1e-6, kv[1]["atr"])), reverse=True)[:3]
             eq = account_equity()
+            jlog("entry_window_open", candidates=len(CANDIDATES), trying=len(ranked), equity=eq)
             for sym, data in ranked:
-                try:
-                    qty = position_size_from_atr(eq, data["facts"]["atr"], data["price"])
-                    if qty <= 0: 
-                        continue
-                    entry = round(data["price"], 2)
-                    order = place_entry_order(sym, qty, entry)
-                    send_telegram(f"➡️ Entry submitted: BUY {qty} {sym} @ ${entry}")
-                    # place stop after fill check (simplified: place immediately)
-                    stop_price = compute_initial_stop(entry, None, data["facts"]["atr"])
-                    st = place_stop_order(sym, qty, stop_price)
+                qty = position_size_from_atr(eq, data["atr"], data["price"])
+                if qty <= 0:
+                    jlog("skip_qty_zero", sym=sym, price=data["price"], atr=data["atr"], equity=eq)
+                    continue
+                order_id = place_entry(sym, qty, data["price"])
+                if order_id:
+                    send_telegram(f"➡️ BUY {qty} {sym} @ {Settings.ENTRY_STYLE} (ref {data['price']:.2f}) | tgt {data['target']} | stop {compute_initial_stop(data['price'], data['atr'])}")
                     PORTFOLIO[sym] = {
-                        "qty": qty, "avg_price": entry, "stop_id": st.id if hasattr(st,'id') else None,
-                        "target": data["target"], "target_date": (now_et()+timedelta(weeks=data["time_weeks"])).date(),
-                        "opened_at": now_et(), "thesis": data["memo"], "atr": data["facts"]["atr"], "highest_close": entry
+                        "qty": qty,
+                        "avg_price": data["price"],
+                        "stop_id": None,
+                        "target": data["target"],
+                        "target_date": (now_et() + timedelta(weeks=data["time_weeks"])).date(),
+                        "opened_at": now_et(),
+                        "atr": data["atr"],
+                        "highest_close": data["price"],
                     }
-                except Exception as e:
-                    log.error(f"entry for {sym} failed: {e}")
-                    send_telegram(f"Entry failed {sym}: {e}")
+                    stp = compute_initial_stop(data["price"], data["atr"])  # place after entry
+                    sid = place_stop(sym, qty, stp)
+                    if sid:
+                        PORTFOLIO[sym]["stop_id"] = sid
+                    jlog("entry_order", sym=sym, qty=qty, order_id=order_id, stop=sid, target=data["target"]) 
             await asyncio.sleep(120)
         else:
             await asyncio.sleep(20)
 
+
 async def monitor_positions_task():
-    """End-of-day trailing stop update and periodic status."""
     while True:
         if not PORTFOLIO:
             await asyncio.sleep(60); continue
         try:
             for sym, pos in list(PORTFOLIO.items()):
-                # refresh last close
                 df = get_aggs(sym, "day", 10)
                 if df.empty: continue
                 last_close = float(df["c"].iloc[-1])
                 pos["highest_close"] = max(pos.get("highest_close", last_close), last_close)
-                profit_ratio = (last_close - pos["avg_price"])/pos["avg_price"]
-                trail = compute_trailing_stop(pos["highest_close"], pos["atr"], profit_ratio)
-                # If price < trail → close
+                pr = (last_close - pos["avg_price"]) / pos["avg_price"]
+                trail = compute_trailing_stop(pos["highest_close"], pos["atr"], pr)
                 if last_close <= trail:
                     try:
-                        close_position_percent(sym, 1.0)
-                        send_telegram(f"🛡️ Trailing stop hit: {sym} @ ~${last_close:.2f}")
+                        if not SETTINGS.DRY_RUN and SETTINGS.PLACE_ORDERS:
+                            close_position_percent(sym, 1.0)
+                        send_telegram(f"🛡️ Trailing stop hit: {sym} ~{last_close:.2f}")
                         PORTFOLIO.pop(sym, None)
                     except Exception as e:
-                        log.error(f"trail close {sym} failed: {e}")
-                # time exit
+                        jlog("trail_close_err", sym=sym, err=str(e))
                 if now_et().date() >= pos["target_date"]:
                     try:
-                        close_position_percent(sym, 1.0)
+                        if not SETTINGS.DRY_RUN and SETTINGS.PLACE_ORDERS:
+                            close_position_percent(sym, 1.0)
                         send_telegram(f"⏱ Time exit reached: {sym}")
                         PORTFOLIO.pop(sym, None)
                     except Exception as e:
-                        log.error(f"time exit {sym} failed: {e}")
+                        jlog("time_exit_err", sym=sym, err=str(e))
         except Exception as e:
-            log.error(f"monitor error: {e}")
+            jlog("monitor_err", err=str(e))
         await asyncio.sleep(300)
 
-# =========================
-# Telegram commands
-# =========================
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Swing Investor Bot online. Use /status, /portfolio, /research TICKER, /rebalance, /pause, /resume, /close TICKER")
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    acct = alpaca.get_account()
-    text = (f"*Status*\n"
-            f"Equity: ${float(acct.equity):,.2f}\n"
-            f"Cash:   ${float(acct.cash):,.2f}\n"
-            f"Paused: {'Yes' if PAUSED else 'No'}\n"
-            f"Candidates: {len(CANDIDATES)} | Watchlist: {len(WATCHLIST)} | Positions: {len(PORTFOLIO)}")
-    await update.message.reply_text(text, parse_mode="Markdown")
+# =============================================================================
+# Telegram Commands (only if polling ON)
+# =============================================================================
+if TELEGRAM_IMPORTED:
+    async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            acct = alpaca.get_account(); eq = float(acct.equity); cash = float(acct.cash)
+        except Exception:
+            eq, cash = 0.0, 0.0
+        await update.message.reply_text(json.dumps({
+            "equity": eq, "cash": cash, "paused": PAUSED,
+            "candidates": len(CANDIDATES), "watchlist": len(WATCHLIST), "positions": len(PORTFOLIO)
+        }, indent=2))
 
-async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not PORTFOLIO:
-        await update.message.reply_text("No open swing positions.")
-        return
-    lines=[]
-    for s,p in PORTFOLIO.items():
-        lines.append(f"*{s}* qty {p['qty']} @ ${p['avg_price']:.2f} → tgt ${p['target']:.2f} by {p['target_date']}")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        sym = (context.args[0] if context.args else "AAPL").upper()
+        df = get_aggs(sym, "day", 90)
+        if df.empty:
+            await update.message.reply_text("No data."); return
+        a = atr(df, 14) or 1.0
+        price = float(df["c"].iloc[-1])
+        f = get_fundamentals_snapshot(sym)
+        o = get_options_signals(sym)
+        sb = score_breakdown(f,o,momentum_20d(df))
+        await update.message.reply_text(json.dumps({"facts":{**f,**o,"price":price,"atr":a}, "score":sb}, indent=2))
 
-async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        sym = context.args[0].upper()
-    except Exception:
-        await update.message.reply_text("Usage: /research TICKER")
-        return
-    df = get_aggs(sym, "day", 90)
-    if df.empty:
-        await update.message.reply_text("No data.")
-        return
-    a = atr(df, 14); price = float(df['c'].iloc[-1]); mom = momentum_20d(df)
-    f = get_fundamentals_snapshot(sym); o = get_options_signals(sym)
-    facts={"price":price,"atr":a,"mom20":mom, **f, **o}
-    memo = gpt_web_research_memo(sym, facts)
-    text = f"*{sym} research*\nTarget: {memo.get('target_price')} | {memo.get('time_weeks')}w | Conf {memo.get('confidence')}\n{memo.get('thesis','')[:1500]}"
-    await update.message.reply_text(text, parse_mode="Markdown")
 
-async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        sym = context.args[0].upper()
-        if sym not in PORTFOLIO:
-            await update.message.reply_text("Not in portfolio.")
-            return
-        close_position_percent(sym, 1.0)
-        PORTFOLIO.pop(sym, None)
-        await update.message.reply_text(f"Closed {sym}.")
-    except Exception as e:
-        await update.message.reply_text(f"Close error: {e}")
-
-async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global PAUSED; PAUSED=True
-    await update.message.reply_text("Trading paused.")
-
-async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global PAUSED; PAUSED=False
-    await update.message.reply_text("Trading resumed.")
-
-async def cmd_rebalance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await daily_research_and_selection()
-    await update.message.reply_text("Rebalanced candidates from scratch.")
-
-# =========================
-# Schedulers
-# =========================
+# =============================================================================
+# Scheduling & Main
+# =============================================================================
 async def schedule_daily_research():
-    """Run at the configured ET time once per day."""
     while True:
         n = now_et()
-        hh, mm = SETTINGS.DAILY_RESEARCH_ET
+        hh, mm = Settings.DAILY_RESEARCH_ET
         run_at = n.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        if n > run_at:
-            run_at = run_at + timedelta(days=1)
-        wait = (run_at - n).total_seconds()
-        await asyncio.sleep(wait)
+        if n > run_at: run_at += timedelta(days=1)
+        await asyncio.sleep(max(1, int((run_at-n).total_seconds())))
         await daily_research_and_selection()
 
-# =========================
-# Main
-# =========================
-async def main():
-    send_telegram("🤖 Swing Investor Bot starting…")
 
-    # Bring in any open positions to state (optional; simple sync)
+async def main():
+    jlog("boot", paper=ALPACA_IS_PAPER, log_level=LOG_LEVEL, place_orders=SETTINGS.PLACE_ORDERS, entry_style=SETTINGS.ENTRY_STYLE, scan_limit=SETTINGS.SCAN_LIMIT)
+
+    # Sync existing positions (best-effort)
     try:
-        open_positions = alpaca.get_all_positions()
-        for p in open_positions:
-            if p.side != "long":
+        for p in alpaca.get_all_positions():
+            if getattr(p, "side", "long") != "long":
                 continue
             PORTFOLIO[p.symbol] = {
                 "qty": int(float(p.qty)),
                 "avg_price": float(p.avg_entry_price),
                 "stop_id": None,
-                "target": float(p.avg_entry_price)*1.15,  # placeholder
-                "target_date": (now_et()+timedelta(weeks=8)).date(),
+                "target": float(p.avg_entry_price) * 1.15,
+                "target_date": (now_et() + timedelta(weeks=8)).date(),
                 "opened_at": now_et(),
-                "thesis": {"thesis":"synced"},
                 "atr": 1.0,
-                "highest_close": float(p.avg_entry_price)
+                "highest_close": float(p.avg_entry_price),
             }
     except Exception as e:
-        log.warning(f"sync positions skipped: {e}")
+        jlog("sync_positions_err", err=str(e))
 
-    # Telegram bot
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("portfolio", cmd_portfolio))
-    app.add_handler(CommandHandler("research", cmd_research))
-    app.add_handler(CommandHandler("close", cmd_close))
-    app.add_handler(CommandHandler("pause", cmd_pause))
-    app.add_handler(CommandHandler("resume", cmd_resume))
-    app.add_handler(CommandHandler("rebalance", cmd_rebalance))
-    await app.initialize(); await app.start()
-    asyncio.create_task(app.updater.start_polling())
+    await daily_research_and_selection()
 
-    # Background loops
-    tasks = [
+    if TELEGRAM_POLLING and TELEGRAM_TOKEN and TELEGRAM_IMPORTED:
+        try:
+            app = Application.builder().token(TELEGRAM_TOKEN).build()
+            app.add_handler(CommandHandler("status", cmd_status))
+            app.add_handler(CommandHandler("research", cmd_research))
+            await app.initialize(); await app.start(); asyncio.create_task(app.updater.start_polling())
+            jlog("telegram_polling_started")
+        except Exception as e:
+            jlog("telegram_poll_err", err=str(e))
+
+    await asyncio.gather(
         schedule_daily_research(),
         entry_window_task(),
         monitor_positions_task(),
-    ]
-    await asyncio.gather(*tasks)
+    )
+
 
 if __name__ == "__main__":
     try:
