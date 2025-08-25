@@ -55,7 +55,7 @@ class Settings:
     SIMULATION_MODE: bool = False
     SIMULATED_ET_HOUR: int = 8
 
-    MIN_PRICE: float = 0.1
+    MIN_PRICE: float = 0.01
     MAX_PRICE: float = 1000.0
     MIN_AVG_DOLLAR_VOLUME: float = 100_000
     MIN_PM_VOLUME: int = 10000
@@ -63,7 +63,7 @@ class Settings:
     MAX_SHARES_OUTSTANDING: int = 100_000_000
     MIN_ATR_PERCENT: float = 3.0
     MAX_SPREAD_PERCENT: float = 1.5
-    MIN_GAP_PERCENT: float = 30.0
+    MIN_GAP_PERCENT: float = 20.0
 
     TRADE_NOTIONAL_VALUE: float = 1000.0
     MAX_POSITIONS: int = int(os.getenv("MAX_POSITIONS", 20))
@@ -1114,4 +1114,5 @@ if __name__ == "__main__":
         logging.info("Shutdown signal received.")
     finally:
         logging.info("--- TRADING BOT SHUT DOWN ---")
+
         send_telegram_alert("⏹️ *Short King bot shutdown complete.*")
