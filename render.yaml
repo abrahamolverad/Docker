@@ -52,6 +52,13 @@ envVarGroups:
       - key: CRYPTO_AUTHORIZED_TELEGRAM_USER_IDS
         value: "YOUR_CRYPTO_GENIE_AUTHORIZED_IDS_COMMA_SEP"
 
+  - name: market-data-keys
+    envVars:
+      - key: POLYGON_API_KEY
+        value: "YOUR_POLYGON_API_KEY_HERE"
+      - key: BENZINGA_API_KEY
+        value: "YOUR_BENZINGA_API_KEY_HERE"
+
 services:
   - name: webapi
     type: web
@@ -151,4 +158,27 @@ services:
         value: "crypto"
       - key: EXECUTOR_SCRIPT
         value: "crypto_genie.py"
+    autoDeploy: yes
+
+  - name: swing-gpt
+    type: worker
+    env: docker
+    region: frankfurt
+    plan: standard
+    dockerfilePath: ./swing_gpt/Dockerfile
+    envVars:
+      - fromGroup: market-data-keys
+      - fromGroup: other-api-keys
+      - key: OPENAI_MODEL
+        value: "gpt-5-nano"
+      - key: ALPACA_KEY_ID
+        value: "YOUR_ALPACA_KEY_ID"
+      - key: ALPACA_SECRET_KEY
+        value: "YOUR_ALPACA_SECRET_KEY"
+      - key: ALPACA_PAPER_BASE
+        value: "https://paper-api.alpaca.markets"
+      - key: TELEGRAM_BOT_TOKEN
+        value: "YOUR_TELEGRAM_BOT_TOKEN_HERE"
+      - key: ACCOUNT_EQUITY
+        value: "25000"
     autoDeploy: yes
