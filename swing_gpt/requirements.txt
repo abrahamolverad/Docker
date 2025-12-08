@@ -7,4 +7,14 @@ openai>=1.0.0,<2.0.0
 pyarrow
 pydantic
 alpaca-trade-api
-
+alpaca-py
+polygon-api-client
+python-telegram-bot
+pymongo
+python-dotenv
+pandas
+numpy
+openai
+requests
+pytz
+dnspython
