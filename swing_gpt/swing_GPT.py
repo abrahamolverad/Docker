@@ -1,13 +1,15 @@
 # ==============================================================================
 # --- SHORT KING: UNHINGED RISK MANAGEMENT EDITION (LIVE) ---
 #
-# MODIFIED VERSION:
-# - RISK: Global 10% Hard Stop (PM & RTH).
-# - RISK: 15% Ratchet System (Trails by 1% after 15% gain).
+# MODIFIED VERSION (V6):
+# - BASE: Strictly follows SHORTKING_DEC25.PY structure (1400+ line equiv).
+# - RISK: Global 10% Hard Stop (PM & RTH) -> ACTIVE.
+# - RISK: 15% Ratchet System -> DEACTIVATED (Parked for future use).
 # - MEMORY: MongoDB restored for High/Low/Avg tracking.
 # - STRATEGY: Opening Bell (9:30-9:35) sniper logic based on PM behavior.
 # - EXECUTION: Forced Liquidation (Internal Trigger) for PM & RTH.
-# - BASE: Full preservation of original scanning/execution logic.
+# - UPDATE V5: Added "Trend Meter" (e.g., 30% Positive / 70% Negative) to PnL.
+# - UPDATE V5: Startup state recovery prevents re-entry.
 # ==============================================================================
 
 import asyncio
@@ -26,6 +28,7 @@ import math # Import math for ceil
 from types import SimpleNamespace
 import pytz
 import pandas as pd
+import numpy as np
 
 # --- Vendor Client Imports ---
 import requests
@@ -48,11 +51,16 @@ from telegram.request import HTTPXRequest
 # --- Database Imports (RESTORED) ---
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure
-import numpy as np
 import openai
+
+# ==============================================================================
+# --- REMOVED RATCHET ENGINE & RISK MATRIX CONFIGURATION ---
+# ==============================================================================
+# RatchetSettings dataclass and RATCHET_CONFIG object removed.
 
 NY_TZ_STR: str = "America/New_York"
 NY_TZ = pytz.timezone(NY_TZ_STR)
+SIMPLE_STOP_LOSS_PCT: float = 0.20 # Legacy 20% stop loss (Overridden by Risk Manager)
 POST_CANCEL_SLEEP: float = 0.75
 POST_PLACE_SLEEP: float = 0.2
 CANCEL_RETRIES: int = 12
@@ -90,7 +98,6 @@ class Settings:
     RATCHET_TRIGGER_PCT: float = 0.15   # 15% Profit triggers the ratchet
     RATCHET_TRAILING_STEP: float = 0.01 # 1% Trailing step
     OPENING_BELL_DURATION: int = 5      # Minutes (9:30-9:35)
-
 
 SETTINGS = Settings()
 
@@ -292,7 +299,7 @@ async def universal_risk_manager(symbol, pos_obj: Position):
     """
     STRICT RISK MANAGEMENT LAYER.
     1. GLOBAL: 10% Max Loss Cap (Hard Stop).
-    2. RATCHET: Triggers at 15% profit, trails by 1%.
+    2. RATCHET: DEACTIVATED (Logic parked).
     3. OPENING BELL (9:30-9:35): Uses Memory to kill losers on pullback or take winners at highs.
     """
     if symbol in SETTINGS.BLACKLISTED_TICKERS: return
@@ -303,7 +310,7 @@ async def universal_risk_manager(symbol, pos_obj: Position):
         last = float(pos_obj.current_price)
         pnl_pct = pnl_pct_short(entry, last) # Returns positive float for profit, negative for loss
         
-        # 2. Update Memory (Critical for 9:30 Logic)
+        # 2. Update Memory (Critical for 9:30 Logic & Trend Meter)
         mem_doc = await asyncio.to_thread(update_position_memory, symbol, pnl_pct)
         if not mem_doc: return # Fail safe
 
@@ -318,10 +325,8 @@ async def universal_risk_manager(symbol, pos_obj: Position):
             return
 
         # --- RULE 2: THE RATCHET (PROFIT PROTECTION) ---
-        # "IF GOES HIGHER THAN 15% LET IT RUN... CEILING 1% INCREASING"
-        # Logic: If we ever saw a high of 18%, and now we are at 16.9%, we hold.
-        # If we drop to 16.9% (High - 1.1%), we kill it.
-        # We use a 1% trailing variance from the ALL-TIME HIGH recorded in Mongo.
+        # [PARKED / DEACTIVATED]
+        # To RE-ENABLE: Uncomment the 'logger' and 'liquidate' lines inside the block below.
         
         highest_seen = mem_doc.get('highest_pnl_pct', 0.0)
         
@@ -330,9 +335,11 @@ async def universal_risk_manager(symbol, pos_obj: Position):
             
             if pnl_pct < stop_trigger:
                 reason = f"Ratchet Hit: Dropped 1% from High ({highest_seen:.2%} -> {pnl_pct:.2%})"
-                logger.info(f"💰 TAKING PROFIT on {symbol}. {reason}")
-                await liquidate_position_safely(symbol, reason)
-                return
+                # === DEACTIVATED FOR UNLIMITED UPSIDE ===
+                # logger.info(f"💰 TAKING PROFIT on {symbol}. {reason}")
+                # await liquidate_position_safely(symbol, reason)
+                # return
+                pass # Proceed without liquidating
 
         # --- RULE 3: OPENING BELL EXECUTION (9:30 AM - 9:35 AM) ---
         # "CRITICAL PART... FIRST 5 MINUTES... TOUCHES HIGHEST POINT OR... LESS NEGATIVE THAN AVERAGE"
@@ -507,6 +514,10 @@ async def premarket_gapper_scanner_task():
                 
                 if sym in POTENTIAL_GAPPERS or sym in TRADED_SYMBOLS_TODAY:
                     reasons["already_processed"] += 1; continue
+                
+                # NEW: Explicit check for OPEN_POSITIONS to prevent re-vetting active trades
+                if sym in OPEN_POSITIONS: 
+                    reasons["already_processed"] += 1; continue 
                 
                 # === MODIFICATION: Use new 15.0% threshold ===
                 if snap.pct < SETTINGS.MIN_GAP_PERCENT: # Now 15.0%
@@ -923,21 +934,28 @@ async def run_trading_stream():
         logging.error(f"Trading stream terminated: {exc}")
 
 # ==============================================================================
+# --- ADVANCED VETTING (REMOVED) ---
+# ==============================================================================
+# REMOVED: get_catalyst_classification
+# REMOVED: get_advanced_vetting_data
+# REMOVED: advanced_vetting_task
+
+# ==============================================================================
 # --- TELEGRAM BOT & BACKGROUND TASKS ---
 # ==============================================================================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("*Short_King_GPT UNHINGED Risk v2 (LIVE)* is running.", parse_mode='Markdown') # Update version
+    await update.message.reply_text("*Short_King_GPT UNHINGED Risk v6 (LIVE)* is running.", parse_mode='Markdown') # Update version
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await sync_positions_with_broker()
     active_positions = {s: d for s, d in OPEN_POSITIONS.items() if s not in SETTINGS.BLACKLISTED_TICKERS}
     pnl = sum(float(p['position_obj'].unrealized_pl) for p in active_positions.values() if p.get('position_obj'))
     phase = get_current_market_phase()
-    text = (f"*Short King Unhinged Risk v2 (LIVE)*\n" # Update version
+    text = (f"*Short King Unhinged Risk v6 (LIVE)*\n" # Update version
             f"*Market Phase:* {phase}\n"
             f"*Open Positions:* {len(active_positions)}/{SETTINGS.MAX_POSITIONS}\n"
             f"*Trading Enabled:* {'✅' if trading_enabled else '⏸️'}\n"
-            f"*Stop-Loss Rule:* 10% Hard / 15% Ratchet\n" # Added new rule
+            f"*Stop-Loss Rule:* 10% Hard / Ratchet PAUSED\n" # Added new rule
             f"*Unrealized P/L:* `${pnl:+.2f}`\n"
             f"*Realized P/L Today:* `${REALIZED_PNL_TODAY:+.2f}`")
     await update.message.reply_text(text, parse_mode='Markdown')
@@ -949,7 +967,7 @@ async def positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not active_positions:
         await update.message.reply_text("No active (non-blacklisted) short positions."); return
 
-    message = "*--- Open Positions (10% Stop / 15% Ratchet) ---*\n"
+    message = "*--- Open Positions (10% Stop / Ratchet PAUSED) ---*\n"
     for symbol, data in active_positions.items():
         pos = data.get('position_obj')
         if not pos: continue
@@ -1163,6 +1181,7 @@ async def telegram_status_summary_task():
             logger.error(f"Telegram status summary failed: {e}")
 
 # MODIFIED: Simplified PNL update, removed timers/floors
+# RE-ADDED: TIMER & TREND METER LOGIC HERE
 async def telegram_pnl_update_task():
     while True:
         await asyncio.sleep(SETTINGS.TELEGRAM_PNL_UPDATE_INTERVAL) 
@@ -1170,7 +1189,7 @@ async def telegram_pnl_update_task():
         if not active_positions or not is_trading_day() or get_current_market_phase() == MarketPhase.CLOSED: continue
 
         try:
-            message = "📊 *Live P&L Update*\n"
+            message = "📊 *Live P&L & Trend Meter*\n"
             total_unrealized_pl = 0.0
             market_phase = get_current_market_phase()
 
@@ -1182,9 +1201,32 @@ async def telegram_pnl_update_task():
                     pnl_usd = float(pos.unrealized_pl)
                     pnl_pct = pnl_pct_short(float(pos.avg_entry_price), float(pos.current_price))
                     total_unrealized_pl += pnl_usd
+                    
+                    # --- TIMER & TREND FETCH LOGIC ---
+                    time_str = "0m 0s"
+                    trend_str = ""
+                    try:
+                        mem = await asyncio.to_thread(pos_mem.find_one, {"symbol": symbol})
+                        if mem:
+                            ticks_green = mem.get('ticks_in_profit', 0)
+                            ticks_red = mem.get('ticks_in_loss', 0)
+                            total_ticks = ticks_green + ticks_red
+                            
+                            # Calculate total duration (Approx 2s per tick)
+                            secs = total_ticks * 2
+                            time_str = f"{secs // 60}m {secs % 60}s"
+                            
+                            # Calculate Trend %
+                            if total_ticks > 0:
+                                pct_green = (ticks_green / total_ticks) * 100
+                                pct_red = (ticks_red / total_ticks) * 100
+                                trend_str = f" (🟢{int(pct_green)}% 🔴{int(pct_red)}%)"
+                            
+                    except Exception as mem_e:
+                        logger.error(f"Failed to fetch timer for {symbol}: {mem_e}")
 
-                    # === MODIFICATION: Simplified status line ===
-                    status_line = f"`${symbol}`: `{pnl_pct:+.2%}` (`${pnl_usd:+.2f}`)"
+                    # === MODIFICATION: Enhanced status line ===
+                    status_line = f"`${symbol}`: `{pnl_pct:+.2%}` (`${pnl_usd:+.2f}`) | Time: {time_str}{trend_str}"
 
                     # Removed all timer/floor logic
                     if market_phase != MarketPhase.PRE_MARKET:
@@ -1271,6 +1313,36 @@ async def cancel_stale_pm_orders_task():
         await asyncio.sleep(3600 * 23)
 
 # ==============================================================================
+# --- STARTUP RECOVERY LOGIC (NEW) ---
+# ==============================================================================
+async def repopulate_state_on_startup():
+    """
+    Fetches today's orders to repopulate TRADED_SYMBOLS_TODAY.
+    This prevents re-entering trades if the bot is restarted.
+    """
+    logger.info("--- REPOPULATING TRADING STATE FROM BROKER ---")
+    try:
+        today = datetime.now(NY_TZ).date()
+        today_str = today.strftime('%Y-%m-%d')
+        
+        # Get all filled orders for today
+        req = GetOrdersRequest(status=QueryOrderStatus.FILLED, after=today_str)
+        filled_orders = await asyncio.to_thread(trading_client.get_orders, filter=req)
+        
+        count = 0
+        for order in filled_orders:
+            # If we sold (entered short) today, mark as traded
+            if order.side == OrderSide.SELL:
+                TRADED_SYMBOLS_TODAY.add(order.symbol)
+                count += 1
+                
+        logger.info(f"State Recovery: Marked {count} symbols as already traded today: {TRADED_SYMBOLS_TODAY}")
+        await send_telegram_alert(f"🔄 *State Restored:* Recognized {count} symbols already traded today.")
+        
+    except Exception as e:
+        logger.error(f"Failed to repopulate state: {e}")
+
+# ==============================================================================
 # --- STARTUP & MAIN LOOP ---
 # ==============================================================================
 async def cancel_all_open_orders_on_startup():
@@ -1317,6 +1389,8 @@ async def sync_positions_with_broker():
                 "accumulated_filled_qty": 0.0, "accumulated_pnl_this_trade": 0.0 
             }
 
+            # === REMOVED: GTC stop logic for discovered positions ===
+
     except Exception as e:
         logger.error(f"Error during position sync with broker: {e}", exc_info=True)
 
@@ -1324,10 +1398,11 @@ async def sync_positions_with_broker():
 async def main():
     """Main entry point for the bot."""
     check_environment_variables()
-    logger.info(f"--- Initializing Short_King_GPT UNHINGED RISK v2 (LIVE TRADING) ---") 
+    logger.info(f"--- Initializing Short_King_GPT UNHINGED RISK v6 (LIVE TRADING) ---") # Updated version
     
     await cancel_all_open_orders_on_startup()
     await sync_positions_with_broker() 
+    await repopulate_state_on_startup() # NEW: Recover state
     
     await sync_daily_realized_pnl()
 
@@ -1359,6 +1434,7 @@ async def main():
         premarket_gapper_scanner_task(),
         priority_monitoring_task(),
         vetting_and_execution_task(), # Renamed
+        # advanced_vetting_task(), # REMOVED
         manage_open_positions_task(),
         manage_pending_orders_task(),
         run_heartbeat(),
@@ -1377,7 +1453,7 @@ async def main():
         await app.updater.start_polling(drop_pending_updates=True) 
         
         active_pos_count = len([s for s in OPEN_POSITIONS if s not in SETTINGS.BLACKLISTED_TICKERS])
-        await send_telegram_alert(f"🤖 *Short King UNHINGED Risk v2 LIVE TRADING...*\nNow tracking {active_pos_count} active positions.") # Updated version
+        await send_telegram_alert(f"🤖 *Short King UNHINGED Risk v6 LIVE TRADING...*\nNow tracking {active_pos_count} active positions.\nState Restored: {len(TRADED_SYMBOLS_TODAY)} symbols.") # Updated version
 
         await asyncio.gather(*main_tasks)
 
